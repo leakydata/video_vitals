@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+idf/build/
+idf/managed_components/
+idf/sdkconfig
+idf/sdkconfig.old
+idf/test/test_rppg
+idf/test/replay
+idf/test/t_exp
+firmware/**/build/
+data/*
+!data/SOURCES.md
+recordings/
+snapshot_*.png
