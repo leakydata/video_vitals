@@ -7,17 +7,23 @@ The heart rate is computed on the ESP32. This viewer shows:
   * the pulse waveform, computed here with POS from the device's own
     uncompressed per-frame ROI samples (for display only)
   * the device's heart rate, quality, and lock state
-  * the device's breathing rate, the image tile it is measured on, and the
-    breathing waveform (that tile's displacement)
+  * the device's breathing rate, every region it is fused from (the best one
+    highlighted), and that region's displacement waveform
 
 Keys: q quit | m magnification | a re-auto-expose | r rotate 180
       +/- exposure | M toggle mono(IR) mode | b adult/infant breathing band
       p breathing pacer on/off, [ ] pacer rate | s snapshot
 
+The pacer rate can also be set from outside while the viewer runs, by writing a
+number (or "off") to the file given by --pacer-file, e.g.
+    echo 20 > /tmp/heartcam_pacer
+Every change is timestamped into <recording>.marks.txt for scoring afterwards.
+
 The pacer is a reference for testing: breathe in while the circle grows and
 out while it shrinks, and compare the device's rate with the pacer's.
 """
 import argparse
+import os
 import re
 import struct
 import threading
@@ -266,22 +272,34 @@ def breathing_wave(motion, ch, seconds=30.0):
     return sosfiltfilt(sos, x)
 
 
-def draw_chest(img, meta):
-    x, y, w, h = meta[26:30]
-    if x >= 0 and w > 0:
-        cv2.rectangle(img, (x, y), (x + w, y + h), (255, 255, 0), 1)
-        cv2.putText(img, "chest", (x + 3, y + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+def breathing_regions(img, meta, sel, best):
+    """Outline every region the breathing rate is fused from; highlight the best.
 
-
-def draw_tile(img, ch, color):
-    if ch < 0 or ch >= 32:  # the chest/head channels have their own boxes
-        return
-    t = ch // 2
-    tx, ty = t % 4, t // 4
-    x0, y0 = tx * img.shape[1] // 4, ty * img.shape[0] // 4
-    cv2.rectangle(img, (x0, y0), (x0 + img.shape[1] // 4 - 1, y0 + img.shape[0] // 4 - 1), color, 1)
-    arrow = "|" if ch % 2 == 0 else "-"
-    cv2.putText(img, "breath " + arrow, (x0 + 3, y0 + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
+    Channels 0..31 are the 4x4 tile grid (even = vertical motion, odd = horizontal),
+    32/33 the chest box, 34/35 the head box.
+    """
+    H, W = img.shape[:2]
+    for ch in sel:
+        is_best = ch == best
+        col = (255, 255, 0) if is_best else (110, 110, 0)
+        axis = "|" if ch % 2 == 0 else "-"
+        if ch >= 34:                      # head box = the face box
+            x, y = meta[0], meta[1]
+            w, h = meta[2] - meta[0], meta[3] - meta[1]
+            label = "head " + axis
+        elif ch >= 32:                    # chest box
+            x, y, w, h = meta[26:30]
+            label = "chest " + axis
+        else:
+            t = ch // 2
+            x, y = (t % 4) * W // 4, (t // 4) * H // 4
+            w, h = W // 4 - 1, H // 4 - 1
+            label = "breath " + axis
+        if x < 0 or w <= 0:
+            continue
+        cv2.rectangle(img, (x, y), (x + w, y + h), col, 2 if is_best else 1)
+        if is_best:
+            cv2.putText(img, label, (x + 3, y + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1)
 
 
 def draw_overlay(img, meta):
@@ -320,6 +338,9 @@ def main():
     ap.add_argument("--no-video", action="store_true", help="do not stream video (faster on-device fps)")
     ap.add_argument("--seconds", type=float, default=0, help="stop after N seconds")
     ap.add_argument("--record", help="save the raw serial stream (video + samples + HR) to this file")
+    ap.add_argument("--pacer", type=float, default=0, help="start the breathing pacer at this rate (/min)")
+    ap.add_argument("--pacer-file", default="/tmp/heartcam_pacer",
+                    help="write a rate (or 'off') to this file to change the pacer while running")
     args = ap.parse_args()
 
     dev = Device(args.port, args.record)
@@ -333,7 +354,10 @@ def main():
     last_t = None
     last_print = 0
     view = None
-    pacer_on, pacer_rate, pacer_t0 = False, 10.0, time.time()
+    pacer_on, pacer_rate, pacer_t0 = args.pacer > 0, args.pacer or 10.0, time.time()
+    if pacer_on:
+        dev.mark(f"pacer on rate={pacer_rate:.0f}")
+    pacer_mtime = 0.0
     start = time.time()
     try:
         while not args.seconds or time.time() - start < args.seconds:
@@ -348,6 +372,23 @@ def main():
                           f"{rr.get('state')} q={rr.get('q')} snr={rr.get('snr')}", flush=True)
                 continue
 
+            # external pacer control: a number (or "off") in the control file
+            try:
+                mt = os.path.getmtime(args.pacer_file)
+                if mt != pacer_mtime:
+                    pacer_mtime = mt
+                    txt = open(args.pacer_file).read().strip().lower()
+                    if txt in ("off", "0"):
+                        pacer_on = False
+                    elif txt:
+                        pacer_rate = float(np.clip(float(txt), 4, 40))
+                        pacer_on = True
+                        pacer_t0 = time.time()
+                    dev.mark(f"pacer {'on' if pacer_on else 'off'} rate={pacer_rate:.0f}")
+                    print(f"[viewer] pacer {'on' if pacer_on else 'off'} at {pacer_rate:.0f}/min", flush=True)
+            except (OSError, ValueError):
+                pass
+
             if not dev.connected:
                 view = None
             if dev.frames:
@@ -358,8 +399,8 @@ def main():
                     last_t = t
                     left = frame.copy()
                     draw_overlay(left, meta)
-                    draw_tile(left, int(dev.rr.get("best", -1)), (255, 200, 0))
-                    draw_chest(left, meta)
+                    sel = [int(c) for c in dev.rr.get("sel", "").split(",") if c.strip().lstrip("-").isdigit()]
+                    breathing_regions(left, meta, sel, int(dev.rr.get("best", -1)))
                     right = mag(frame, dt) if magnify else frame
                     view = cv2.resize(np.hstack([left, right]), None, fx=args.scale, fy=args.scale)
             if view is None:

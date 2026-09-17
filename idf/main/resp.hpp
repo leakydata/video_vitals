@@ -40,6 +40,7 @@ struct Result {
     float motion;     // masked fraction of the window
     int channels;     // channels fused
     int best;         // best channel (2*tile + axis), -1 if none
+    int8_t sel[8];    // the fused channels themselves (-1 where unused)
 };
 
 class Buffer {
@@ -78,6 +79,7 @@ private:
     float waves_[kChan][N];
     rppg::Tracker trk_;
     int prev_best_ = -1;
+    int sticky_ = 0;
 };
 
 } // namespace resp

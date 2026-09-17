@@ -37,9 +37,9 @@ struct MotionSample {
 
 class TileMotion {
 public:
-    // Frame is RGB565 big-endian (as captured by esp32-camera), w x h.
+    // Frame is YUV422 (YUYV, as captured by esp32-camera), w x h.
     // `boxes` are the face-anchored boxes (chest, head); pass invalid Boxes for none.
-    void process_rgb565be(const uint8_t *px, int w, int h, uint32_t t_ms, bool external_motion,
+    void process_yuyv(const uint8_t *px, int w, int h, uint32_t t_ms, bool external_motion,
                           const Box boxes[kBoxes], MotionSample &out);
     void reset() { have_ref_ = false; for (bool &b : have_box_) b = false; }
 

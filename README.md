@@ -1,11 +1,21 @@
-# heart_cam
+# video_vitals
 
 Contactless heart rate (rPPG) and breathing rate on a XIAO ESP32-S3 Sense
-(OV3660). Both are computed **on the ESP32**; the PC viewer is optional.
+(OV3660). Both are computed **on the ESP32** — no PC, phone or cloud — and the
+PC viewer is optional.
+
+> **This repository is private on purpose.** A prior-art search (2026-09-17)
+> found no published or shipped system computing rPPG *or* camera-based
+> respiration on a microcontroller: existing ESP32 projects stream frames to a
+> PC, and commercial camera-vitals products are phone-, cloud- or server-class.
+> Publishing destroys patent novelty immediately outside the US (the US allows a
+> 12-month grace period), so the repo stays private until that decision is made.
+> The algorithms themselves (POS, Lucas-Kanade, ESP-DL detection) are published
+> work; what appears unclaimed is the integration and the compute envelope.
 
 ## Layout
 - `idf/` — ESP-IDF firmware (current)
-  - `main/main.cpp` — camera (RGB565, uncompressed), ESP-DL face detection
+  - `main/main.cpp` — camera (YUV422, uncompressed, ~15 fps), ESP-DL face detection
     (ESPDet-Pico + MNP landmarks), forehead/cheek ROIs, streaming, commands
   - `main/rppg.cpp` — estimator: POS (or mono/IR) per ROI → Butterworth
     bandpass → spectra → SNR-weighted fusion → harmonic/octave check →
@@ -77,11 +87,22 @@ covered by a regression test (timestamp precision, octave errors, skipped motion
 flags, aliasing, stale buffers, constant-input locks, task synchronisation,
 frame desync, recording annotations, test strictness, host rounding parity).
 
+Measurements (device-side unless stated):
+- YUV422 instead of RGB565 halved the tracker noise floor (0.060 -> 0.029 px of
+  frame-to-frame jitter on quiet channels): 8 bits per sample rather than 5/6/5.
+- 24 MHz camera clock gives ~15 fps at QVGA (20 MHz gave 11); 30 MHz reached
+  ~17 fps cleanly but is left off for margin.
+- Breathing is fused from up to 8 regions, preferring the face-anchored chest and
+  head boxes; with a face present those usually win over background tiles.
+
 Current results:
 - Heart rate: synthetic 105/105 (including 25-day uptime, harmonic-dominant
   pulses, stalled camera); UBFC subject 1 (device-equivalent, 11 fps):
   locked 100%, MAE 1.7 bpm against the current HR; matched a KardiaMobile 6L
   live. (MPU-rPPG sample unused: its PPG and HR columns disagree.)
+- Breathing validated against a paced reference: 10/min read 10/min; 15/min read
+  14.8-15.5 (~0.3/min error); resting rate tracked at ~9-11/min, matching the
+  subject's own 9-12.
 - Breathing: synthetic 41/41 (rendered frames plus direct feeds for skipped
   motion flags, 4.7 Hz aliasing, constant input, timestamps, stalls: 0.15 px chest motion, 6-45/min,
   infant band, rate changes, flicker, local and whole-scene movement, no

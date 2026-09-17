@@ -70,9 +70,7 @@ void TileMotion::profiles(const uint8_t *px, int w, int h)
                 const int t = ty * GRID_X + tx;
                 float rs = 0;
                 for (int c = 0; c < cols_; c++) {
-                    const int x = tx * tw + c * STEP;
-                    const uint16_t v = (row[x * 2] << 8) | row[x * 2 + 1];
-                    const int Y = 77 * (((v >> 11) & 0x1f) << 3) + 150 * (((v >> 5) & 0x3f) << 2) + 29 * ((v & 0x1f) << 3);
+                    const int Y = row[(tx * tw + c * STEP) * 2];  // luminance of this pixel
                     rs += Y;
                     cur_col_[t][c] += Y;
                 }
@@ -94,15 +92,14 @@ void TileMotion::box_profiles(const uint8_t *px, int w, int h, const Box &b, int
         for (int c = 0; c < kBoxProf; c++) {
             const int x = b.x + (c * b.w) / kBoxProf;
             if (x < 0 || x >= w) continue;
-            const uint16_t v = (row[x * 2] << 8) | row[x * 2 + 1];
-            const int Y = 77 * (((v >> 11) & 0x1f) << 3) + 150 * (((v >> 5) & 0x3f) << 2) + 29 * ((v & 0x1f) << 3);
+            const int Y = row[x * 2];  // luminance of this pixel
             cur_brow_[i][r] += Y;
             cur_bcol_[i][c] += Y;
         }
     }
 }
 
-void TileMotion::process_rgb565be(const uint8_t *px, int w, int h, uint32_t t_ms, bool external_motion,
+void TileMotion::process_yuyv(const uint8_t *px, int w, int h, uint32_t t_ms, bool external_motion,
                                   const Box boxes[kBoxes], MotionSample &out)
 {
     profiles(px, w, h);

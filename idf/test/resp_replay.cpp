@@ -1,5 +1,5 @@
 // Runs the firmware breathing pipeline on frames piped from
-// tools/video_frames.py (binary: "FRM1" | u32 t_ms | u16 w | u16 h | RGB565BE),
+// tools/video_frames.py (binary: "FRM1" | u32 t_ms | u16 w | u16 h | YUYV),
 // or on "M ..." motion lines from a heartcam.py recording (--motion file).
 // Prints one CSV row per second.
 // Build: g++ -O2 -std=c++17 -I../main resp_replay.cpp ../main/motion.cpp ../main/resp.cpp -o resp_replay
@@ -93,7 +93,7 @@ int main(int argc, char **argv)
         frame.resize(size_t(w) * h * 2);
         if (std::fread(frame.data(), 1, frame.size(), stdin) != frame.size()) break;
         MotionSample ms;
-        tm.process_rgb565be(frame.data(), w, h, t, false, boxes, ms);
+        tm.process_yuyv(frame.data(), w, h, t, false, boxes, ms);
         feed(ms);
     }
     return 0;

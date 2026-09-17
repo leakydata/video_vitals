@@ -1,7 +1,7 @@
-// heart_cam — contactless heart rate on a XIAO ESP32-S3 Sense (ESP-IDF).
+// video_vitals — contactless heart rate and breathing on a XIAO ESP32-S3 Sense.
 //
 // Tasks
-//   cam     (core 1)  RGB565 QVGA capture, per-ROI skin colour means
+//   cam     (core 1)  YUV422 QVGA capture, per-ROI skin colour means
 //   detect  (core 0)  ESP-DL ESPDet-Pico + MNP landmarks, smoothing, motion flag
 //   hr      (core 1)  rPPG (rppg.cpp) and breathing (resp.cpp) estimators once per second
 //   stream  (core 0)  optional JPEG preview with face/ROI metadata
@@ -163,10 +163,15 @@ static bool camera_init()
     c.pin_vsync = CAM_VSYNC;
     c.pin_href = CAM_HREF;
     c.pin_pclk = CAM_PCLK;
-    c.xclk_freq_hz = 20000000;
+    // 24 MHz gives ~15 fps at QVGA (20 MHz gives 11). 30 MHz runs at ~17 fps and
+    // looked clean in testing, but 24 keeps margin for long unattended runs.
+    c.xclk_freq_hz = 24000000;
     c.ledc_timer = LEDC_TIMER_0;
     c.ledc_channel = LEDC_CHANNEL_0;
-    c.pixel_format = PIXFORMAT_RGB565;  // uncompressed: JPEG artefacts would bury the pulse
+    // YUV422 (YUYV), not RGB565: 8 bits of luminance and chroma per sample
+    // instead of 5/6/5, so quantisation noise no longer limits the pulse, which
+    // is a few tenths of a percent of the signal. Uncompressed either way.
+    c.pixel_format = PIXFORMAT_YUV422;
     c.frame_size = FRAMESIZE_QVGA;
     c.jpeg_quality = 12;
     c.fb_count = 2;
@@ -289,6 +294,8 @@ static int face_rois(const Face &f, Rect out[rppg::kRois])
     return rppg::kRois;
 }
 
+// Mean colour of a ROI from a YUYV frame: the skin test uses the sensor's own
+// chroma (Cb = U, Cr = V) and RGB is reconstructed at full 8-bit precision.
 static rppg::RoiSample roi_mean(const uint8_t *px, const Rect &r, bool any_colour)
 {
     rppg::RoiSample out{0, 0, 0, 0};
@@ -298,14 +305,17 @@ static rppg::RoiSample roi_mean(const uint8_t *px, const Rect &r, bool any_colou
     for (int y = r.y; y < r.y + r.h; y++) {
         const uint8_t *row = px + y * W * 2;
         for (int x = r.x; x < r.x + r.w; x++) {
-            const uint16_t v = (row[x * 2] << 8) | row[x * 2 + 1];  // RGB565 big-endian
-            const int R = ((v >> 11) & 0x1f) << 3, G = ((v >> 5) & 0x3f) << 2, B = (v & 0x1f) << 3;
-            if (R > 244 || G > 248 || B > 244) continue;  // clipped / specular
-            const int Y = (77 * R + 150 * G + 29 * B) >> 8;
+            const int Y = row[x * 2];
+            // chroma is shared by each pixel pair: U at the even sample, V at the odd
+            const int cbase = (x & ~1) * 2;
+            const int Cb = row[cbase + 1], Cr = row[cbase + 3];
+            const int cd = Cr - 128, ce = Cb - 128;
+            const int R = std::clamp(Y + ((91881 * cd) >> 16), 0, 255);
+            const int G = std::clamp(Y - ((22554 * ce + 46802 * cd) >> 16), 0, 255);
+            const int B = std::clamp(Y + ((116130 * ce) >> 16), 0, 255);
+            if (R > 250 || G > 250 || B > 250) continue;  // clipped / specular
             if (Y < 25) continue;
             ar += R; ag += G; ab += B; an++;
-            const int Cr = ((128 * R - 107 * G - 21 * B) >> 8) + 128;
-            const int Cb = ((-43 * R - 85 * G + 128 * B) >> 8) + 128;
             if (Cr < 133 || Cr > 173 || Cb < 77 || Cb > 127) continue;
             sr += R; sg += G; sb += B; n++;
         }
@@ -424,7 +434,7 @@ static void cam_task(void *)
             boxes[1] = {hx, hy, int16_t(std::lround(f.box[2]) - hx), int16_t(std::lround(f.box[3]) - hy)};
         }
         const resp::Box &chest = boxes[0];
-        g_tiles->process_rgb565be(fb->buf, W, H, t_ms, now < f.motion_until_us, boxes, ms);
+        g_tiles->process_yuyv(fb->buf, W, H, t_ms, now < f.motion_until_us, boxes, ms);
 
         xSemaphoreTake(buf_mtx, portMAX_DELAY);
         g_buf->push(s);
@@ -537,10 +547,19 @@ static void detect_task(void *)
         // a face, rotate the sensor.
         const bool try_flipped = misses >= 10 && misses % 5 == 0;
         if (try_flipped) {
-            std::reverse(det_frame, det_frame + W * H * 2);  // reverses pixels and swaps byte order...
-            for (int i = 0; i < W * H * 2; i += 2) std::swap(det_frame[i], det_frame[i + 1]);  // ...restore it
+            // 180 degrees on YUYV: reverse the order of the pixel pairs and swap
+            // the two luminance samples within each (chroma stays with its pair)
+            uint32_t *p32 = (uint32_t *)det_frame;
+            auto swapY = [](uint32_t v) {
+                return (v & 0x00FF00FFu) | ((v >> 16) & 0x0000FF00u) | ((v & 0x0000FF00u) << 16);
+            };
+            for (int i = 0, j = W * H / 2 - 1; i < j; i++, j--) {
+                const uint32_t a = p32[i], b = p32[j];
+                p32[i] = swapY(b);
+                p32[j] = swapY(a);
+            }
         }
-        dl::image::img_t img = {det_frame, W, H, dl::image::DL_IMAGE_PIX_TYPE_RGB565BE};
+        dl::image::img_t img = {det_frame, W, H, dl::image::DL_IMAGE_PIX_TYPE_YUYV};
         const dl::detect::result_t *best = detect_face(det, mnp, img, found) ? &found : nullptr;
         const int64_t now = esp_timer_get_time();
         stats.det_ms = 0.9f * stats.det_ms + 0.1f * (now - start) / 1000.0f;
@@ -658,10 +677,13 @@ static void hr_task(void *)
         xSemaphoreTake(stats.mtx, portMAX_DELAY);
         stats.rr = rr;
         xSemaphoreGive(stats.mtx);
+        char sel[40] = "";
+        for (int i = 0, o = 0; i < 8 && rr.sel[i] >= 0 && o < (int)sizeof(sel) - 4; i++)
+            o += snprintf(sel + o, sizeof(sel) - o, o ? ",%d" : "%d", rr.sel[i]);
         out_printf("RR br=%.1f raw=%.1f snr=%.1f q=%.2f stab=%.2f agree=%.2f state=%s motion=%.2f ch=%d best=%d "
-                   "band=%s est_ms=%.0f\n",
+                   "sel=%s band=%s est_ms=%.0f\n",
                    rr.brpm, rr.raw, rr.snr_db, rr.quality, rr.stability, rr.agreement, state_name(rr.state), rr.motion,
-                   rr.channels, rr.best, cfg.infant ? "infant" : "adult", rms);
+                   rr.channels, rr.best, sel[0] ? sel : "-", cfg.infant ? "infant" : "adult", rms);
     }
 }
 
@@ -669,7 +691,7 @@ static void stream_task(void *)
 {
     for (;;) {
         xSemaphoreTake(str_sem, portMAX_DELAY);
-        dl::image::img_t img = {str_frame, W, H, dl::image::DL_IMAGE_PIX_TYPE_RGB565BE};
+        dl::image::img_t img = {str_frame, W, H, dl::image::DL_IMAGE_PIX_TYPE_YUYV};
         dl::image::jpeg_img_t jpg = dl::image::sw_encode_jpeg(img, cfg.quality);
         if (jpg.data) {
             uint32_t hdr[2] = {uint32_t(jpg.data_len), str_t_ms};

@@ -16,6 +16,8 @@ constexpr float SNR_MID = 5.0f;    // SNR (dB) at which the SNR quality term is 
 constexpr float MOTION_MAX = 0.5f; // max masked fraction for an update
 constexpr int MAX_FUSED = 8;
 constexpr float SELECT_DB = 6.0f;  // fuse channels within this many dB of the best
+constexpr float STICKY_DB = 3.0f;       // how much better a rival channel must be to take over
+constexpr int STICKY_UPDATES = 3;       // ... and for how many consecutive windows
 constexpr float CHEST_BONUS_DB = 2.0f;  // preference for the chest box
 constexpr float HEAD_BONUS_DB = 1.0f;   // ... and a smaller one for the head box
 
@@ -250,17 +252,26 @@ bool Estimator::resample(const MotionSample *s, int n, int ch, float *x)
     // band (up to 1.3 /s for infants) usable while burying anything faster.
     constexpr float FC = 2.0f;
     constexpr int POLES = 3;
+    // The frame interval barely varies, so cache the filter coefficient rather
+    // than calling exp() for every sample of every channel (which cost ~300 ms
+    // per update on the S3).
+    float last_dt = -1, alpha = 0;
+    auto coeff = [&](float dt) {
+        if (std::fabs(dt - last_dt) > 0.001f) {
+            last_dt = dt;
+            alpha = 1 - std::exp(-2 * float(M_PI) * FC * dt);
+        }
+        return alpha;
+    };
     for (int pass = 0; pass < POLES; pass++) {
         float y = rv[0];
         for (int k = 1; k < m; k++) {
-            const float dt = std::max(0.0f, rt[k] - rt[k - 1]) / 1000.0f;
-            y += (1 - std::exp(-2 * float(M_PI) * FC * dt)) * (rv[k] - y);
+            y += coeff(std::max(0.0f, rt[k] - rt[k - 1]) / 1000.0f) * (rv[k] - y);
             rv[k] = y;
         }
         y = rv[m - 1];
         for (int k = m - 2; k >= 0; k--) {
-            const float dt = std::max(0.0f, rt[k + 1] - rt[k]) / 1000.0f;
-            y += (1 - std::exp(-2 * float(M_PI) * FC * dt)) * (rv[k] - y);
+            y += coeff(std::max(0.0f, rt[k + 1] - rt[k]) / 1000.0f) * (rv[k] - y);
             rv[k] = y;
         }
     }
@@ -288,6 +299,7 @@ Result Estimator::update(const MotionSample *s, int n, uint32_t now_ms)
 {
     Result r{};
     r.best = -1;
+    for (int8_t &c : r.sel) c = -1;
     trk_.predict(now_ms);
     if (n < 2 || rppg::ms_diff(s[n - 1].t_ms, s[0].t_ms) < (WINDOW_S - 3) * 1000 ||
         rppg::ms_diff(now_ms, s[n - 1].t_ms) > rppg::STALE_MS) {
@@ -366,9 +378,19 @@ Result Estimator::update(const MotionSample *s, int n, uint32_t now_ms)
         return r;  // no usable window: report nothing, not the last tracked value
     }
     r.channels = sel;
-    // keep reporting the previous best channel unless another is clearly better
+    for (int i = 0; i < sel && i < 8; i++) r.sel[i] = int8_t(order[i]);
+    // Keep reporting the same channel unless another is clearly better for a
+    // while: the displayed region hopping between equally good tiles every
+    // second is just noise to the eye.
     int best = order[0];
-    if (prev_best_ >= 0 && ok[prev_best_] && snr[prev_best_] >= snr[best] - 1.5f) best = prev_best_;
+    if (prev_best_ >= 0 && ok[prev_best_] && rank(prev_best_) >= rank(best) - STICKY_DB) {
+        best = prev_best_;
+        sticky_ = 0;
+    } else if (prev_best_ >= 0 && ok[prev_best_] && ++sticky_ < STICKY_UPDATES) {
+        best = prev_best_;  // one better window is not enough to switch
+    } else {
+        sticky_ = 0;
+    }
     prev_best_ = best;
     r.best = best;
     std::memcpy(wave_, waves_[best], sizeof(wave_));

@@ -1,4 +1,4 @@
-// Host test for breathing detection: renders synthetic 320x240 RGB565 frames
+// Host test for breathing detection: renders synthetic 320x240 YUYV frames
 // (textured scene with a "person" whose chest moves sub-pixel), runs them
 // through TileMotion + resp::Estimator exactly as the firmware does.
 // Build: g++ -O2 -std=c++17 -I../main test_resp.cpp ../main/motion.cpp ../main/resp.cpp -o test_resp
@@ -116,15 +116,14 @@ static int run(const Scenario &sc, unsigned seed)
                 else if (head) v = scene.sample(scene.person, x - jump_x, y - 0.3f * s - beat - jump_y);
                 else v = scene.sample(scene.bg, x, y);
                 v = std::clamp(v * light + sc.noise * g(rng), 0.0f, 255.0f);
-                const int R = int(v) >> 3, G = int(v) >> 2, B = int(v) >> 3;
-                const uint16_t p = (R << 11) | (G << 5) | B;
-                frame[(y * W + x) * 2] = p >> 8;
-                frame[(y * W + x) * 2 + 1] = p & 0xff;
+                // YUYV as the sensor delivers it; the scene is grey, so chroma is neutral
+                frame[(y * W + x) * 2] = uint8_t(v);
+                frame[(y * W + x) * 2 + 1] = 128;
             }
         MotionSample ms;
         // the firmware anchors this under the detected face; the rendered chest is at x 70-250, y >= 130
         const Box boxes[kBoxes] = {{70, 130, 180, 100}, {120, 30, 80, 100}};  // chest, head
-        tm.process_rgb565be(frame.data(), W, H, uint32_t(t * 1000), false, boxes, ms);
+        tm.process_yuyv(frame.data(), W, H, uint32_t(t * 1000), false, boxes, ms);
         buf.push(ms);
 
         if (t >= next) {

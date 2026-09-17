@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stream a video as device-like frames (320x240 RGB565 big-endian) to stdout,
+"""Stream a video as device-like frames (320x240 YUV422/YUYV) to stdout,
 for idf/test/resp_replay. The frame is center-cropped to 4:3 first.
 
 usage: video_frames.py clip.mp4 [--target-fps 11.1] [--max-seconds N] | resp_replay
@@ -45,11 +45,12 @@ def main():
             cw = h * 4 // 3
             frame = frame[:, (w - cw) // 2:(w - cw) // 2 + cw]
         small = cv2.resize(frame, (W, H), interpolation=cv2.INTER_AREA)
-        b = small[..., 0].astype(np.uint16) >> 3
-        g = small[..., 1].astype(np.uint16) >> 2
-        r = small[..., 2].astype(np.uint16) >> 3
-        px = (r << 11) | (g << 5) | b
-        out.write(b"FRM1" + struct.pack("<IHH", round(t * 1000), W, H) + px.astype(">u2").tobytes())
+        yuv = cv2.cvtColor(small, cv2.COLOR_BGR2YUV)  # Y, U, V per pixel
+        buf = np.empty((H, W, 2), np.uint8)
+        buf[..., 0] = yuv[..., 0]                      # Y for every pixel
+        buf[..., 1][:, 0::2] = yuv[..., 1][:, 0::2]    # U from the even pixel of each pair
+        buf[..., 1][:, 1::2] = yuv[..., 2][:, 0::2]    # V from the same pair
+        out.write(b"FRM1" + struct.pack("<IHH", round(t * 1000), W, H) + buf.tobytes())
     out.flush()
 
 
