@@ -24,6 +24,9 @@ Contactless heart rate (rPPG) and breathing rate on a XIAO ESP32-S3 Sense
 - `tools/video_to_samples.py` — converts a face video into device-equivalent samples
 - `tools/evaluate.py` — compares replay output with dataset ground truth
 - `tools/video_frames.py`, `tools/eval_air400.py` — breathing evaluation on AIR-400
+- `tools/radar_ref.py` — live comparison against a Seeed MR60BHA2 radar (independent
+  breathing/heart reference); finds both boards by probing the USB serial ports
+- `tools/session_report.py` — plots a recording: rates, quality, motion, pacer marks
 - `heartcam.py` — PC viewer (video + overlays, Eulerian magnification, pulse plot)
 - `data/` — public test videos (see `data/SOURCES.md`)
 - `firmware/heart_cam/` — first Arduino prototype (superseded)
