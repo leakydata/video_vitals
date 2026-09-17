@@ -32,6 +32,7 @@ struct MotionSample {
     float d[kChan];   // displacement in pixels; channel 2*i = tile i vertical, 2*i+1 horizontal
     uint64_t valid;   // bit per channel: tile has enough texture (34 channels: 64-bit mask)
     uint64_t jump;    // bit per channel: this channel moved too much this frame (local movement)
+    uint64_t subject; // bit per channel: this channel covers the subject (0 = unknown, treat all alike)
     bool gross;       // large movement of the whole scene (not breathing)
 };
 

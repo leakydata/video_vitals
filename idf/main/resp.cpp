@@ -18,6 +18,7 @@ constexpr int MAX_FUSED = 8;
 constexpr float SELECT_DB = 6.0f;  // fuse channels within this many dB of the best
 constexpr float STICKY_DB = 3.0f;       // how much better a rival channel must be to take over
 constexpr int STICKY_UPDATES = 3;       // ... and for how many consecutive windows
+constexpr float OFF_SUBJECT_DB = 6.0f;  // penalty for a region that is not on the subject
 constexpr float CHEST_BONUS_DB = 2.0f;  // preference for the chest box
 constexpr float HEAD_BONUS_DB = 1.0f;   // ... and a smaller one for the head box
 
@@ -247,6 +248,14 @@ bool Estimator::resample(const MotionSample *s, int n, int ch, float *x)
         m++;
     }
     if (m < 4) return false;
+
+    // A channel that barely moved cannot carry breathing. Testing that here,
+    // on the raw samples, skips the filtering and spectrum for it entirely -
+    // those dominate the cost of an update.
+    float mn = rv[0], mx = rv[0];
+    for (int k = 1; k < m; k++) { mn = std::fmin(mn, rv[k]); mx = std::fmax(mx, rv[k]); }
+    if (mx - mn < 0.02f) return false;
+
     // A single pole only reaches about -15 dB near the frame rate, so cascade
     // three each way (six poles, zero phase). At 2 Hz this leaves the breathing
     // band (up to 1.3 /s for infants) usable while burying anything faster.
@@ -255,25 +264,17 @@ bool Estimator::resample(const MotionSample *s, int n, int ch, float *x)
     // The frame interval barely varies, so cache the filter coefficient rather
     // than calling exp() for every sample of every channel (which cost ~300 ms
     // per update on the S3).
-    float last_dt = -1, alpha = 0;
-    auto coeff = [&](float dt) {
-        if (std::fabs(dt - last_dt) > 0.001f) {
-            last_dt = dt;
-            alpha = 1 - std::exp(-2 * float(M_PI) * FC * dt);
-        }
-        return alpha;
-    };
+    // One coefficient for the whole window, from its mean sample interval: the
+    // frame interval varies by a millisecond or two, far too little to matter
+    // for an anti-alias filter, and calling exp() per sample per pole per
+    // channel cost hundreds of milliseconds per update on the S3.
+    const float mean_dt = std::max(1e-3f, (rt[m - 1] - rt[0]) / 1000.0f / (m - 1));
+    const float alpha = 1 - std::exp(-2 * float(M_PI) * FC * mean_dt);
     for (int pass = 0; pass < POLES; pass++) {
         float y = rv[0];
-        for (int k = 1; k < m; k++) {
-            y += coeff(std::max(0.0f, rt[k] - rt[k - 1]) / 1000.0f) * (rv[k] - y);
-            rv[k] = y;
-        }
+        for (int k = 1; k < m; k++) { y += alpha * (rv[k] - y); rv[k] = y; }
         y = rv[m - 1];
-        for (int k = m - 2; k >= 0; k--) {
-            y += coeff(std::max(0.0f, rt[k + 1] - rt[k]) / 1000.0f) * (rv[k] - y);
-            rv[k] = y;
-        }
+        for (int k = m - 2; k >= 0; k--) { y += alpha * (rv[k] - y); rv[k] = y; }
     }
     for (int i = 0, k = 0; i < N; i++) {
         const float t = t_start + i * step;
@@ -361,10 +362,14 @@ Result Estimator::update(const MotionSample *s, int n, uint32_t now_ms)
 
     // select the strongest channels; the chest box (when a face gave us one) is
     // where breathing actually is, so it wins ties against background tiles
+    // when a face told us where the subject is, background regions are demoted
+    const uint64_t subject = s[n - 1].subject;
     auto rank = [&](int ch) {
-        if (ch >= kBoxChan0 + 2) return snr[ch] + HEAD_BONUS_DB;   // head box
-        if (ch >= kBoxChan0) return snr[ch] + CHEST_BONUS_DB;      // chest box
-        return snr[ch];
+        float r = snr[ch];
+        if (ch >= kBoxChan0 + 2) r += HEAD_BONUS_DB;      // head box
+        else if (ch >= kBoxChan0) r += CHEST_BONUS_DB;    // chest box
+        if (subject && !(subject & (1ull << ch))) r -= OFF_SUBJECT_DB;
+        return r;
     };
     int order[kChan], m = 0;
     for (int ch = 0; ch < kChan; ch++)

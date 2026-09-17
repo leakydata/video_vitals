@@ -116,9 +116,9 @@ class Device(threading.Thread):
             self.rr = dict(re.findall(r"(\w+)=([\w.\-]+)", line))
         elif line.startswith("M "):
             v = line.split()
-            if len(v) == 4 + N_CHAN:
+            if len(v) == 5 + N_CHAN:
                 try:
-                    self.motion.append((int(v[1]) / 1000.0, np.array(v[4:], float), int(v[2]), int(v[3])))
+                    self.motion.append((int(v[1]) / 1000.0, np.array(v[5:], float), int(v[2]), int(v[4])))
                 except ValueError:
                     pass
         elif line.startswith("S "):
@@ -272,6 +272,14 @@ def breathing_wave(motion, ch, seconds=30.0):
     return sosfiltfilt(sos, x)
 
 
+def draw_boxes(img, meta):
+    """The face-anchored boxes, always shown when the device has them."""
+    x, y, w, h = meta[26:30]
+    if x >= 0 and w > 0:
+        cv2.rectangle(img, (x, y), (x + w, y + h), (150, 150, 0), 1)
+        cv2.putText(img, "chest", (x + 3, y + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 0), 1)
+
+
 def breathing_regions(img, meta, sel, best):
     """Outline every region the breathing rate is fused from; highlight the best.
 
@@ -399,6 +407,7 @@ def main():
                     last_t = t
                     left = frame.copy()
                     draw_overlay(left, meta)
+                    draw_boxes(left, meta)
                     sel = [int(c) for c in dev.rr.get("sel", "").split(",") if c.strip().lstrip("-").isdigit()]
                     breathing_regions(left, meta, sel, int(dev.rr.get("best", -1)))
                     right = mag(frame, dt) if magnify else frame

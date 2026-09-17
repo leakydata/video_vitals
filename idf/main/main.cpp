@@ -9,7 +9,7 @@
 //
 // Serial protocol (USB Serial/JTAG)
 //   device -> host  text lines: "HR ...", "RR ..." (breathing), "S t r g b n ... motion",
-//                   "M t valid jump gross d0..d31" (tile displacements),
+//                   "M t valid jump subject gross d0..d35" (region displacements),
 //                   "# log"; binary frames:
 //                   'H','C','F','2' | u32 len | u32 t_ms | i16 meta[26] | jpeg
 //                   meta = face box x1,y1,x2,y2 | 5 landmarks (x,y) | 3 ROIs x,y,w,h |
@@ -446,8 +446,9 @@ static void cam_task(void *)
                        s.roi[0].r, s.roi[0].g, s.roi[0].b, s.roi[0].n, s.roi[1].r, s.roi[1].g, s.roi[1].b,
                        s.roi[1].n, s.roi[2].r, s.roi[2].g, s.roi[2].b, s.roi[2].n, s.motion);
             char line[640];
-            int len = snprintf(line, sizeof(line), "M %lu %llu %llu %d", (unsigned long)t_ms,
-                               (unsigned long long)ms.valid, (unsigned long long)ms.jump, ms.gross);
+            int len = snprintf(line, sizeof(line), "M %lu %llu %llu %llu %d", (unsigned long)t_ms,
+                               (unsigned long long)ms.valid, (unsigned long long)ms.jump,
+                               (unsigned long long)ms.subject, ms.gross);
             for (int c = 0; c < resp::kChan && len < (int)sizeof(line) - 12; c++)
                 len += snprintf(line + len, sizeof(line) - len, " %.3f", ms.d[c]);
             line[len++] = '\n';

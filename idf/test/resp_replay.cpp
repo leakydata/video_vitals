@@ -61,9 +61,9 @@ int main(int argc, char **argv)
             std::istringstream ss(line.substr(p + 2));
             MotionSample ms{};
             unsigned long t;
-            unsigned long long valid, jump;
+            unsigned long long valid, jump, subject;
             int gross;
-            if (!(ss >> t >> valid >> jump >> gross)) continue;
+            if (!(ss >> t >> valid >> jump >> subject >> gross)) continue;
             bool ok = true;
             for (float &d : ms.d)
                 if (!(ss >> d)) { ok = false; break; }
@@ -71,6 +71,7 @@ int main(int argc, char **argv)
             ms.t_ms = t;
             ms.valid = valid;
             ms.jump = jump;
+            ms.subject = subject;
             ms.gross = gross;
             feed(ms);
         }

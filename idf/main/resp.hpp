@@ -20,9 +20,9 @@ constexpr float FS = 5.0f;
 constexpr float WINDOW_S = 30.0f;
 constexpr int N = 150;  // WINDOW_S * FS
 // Spectrum: Hann-windowed, zero-padded FFT. Bin k (relative) is (K0 + k) * BR_STEP /min.
-constexpr int NFFT = 1024;
+constexpr int NFFT = 512;   // 0.59 /min per bin, interpolated: plenty for breathing
 constexpr float BR_STEP = 60.0f * FS / NFFT;  // 0.293 breaths/min per bin
-constexpr int K0 = 21;                        // first bin: 6.15 /min
+constexpr int K0 = 11;                        // first bin: 6.4 /min
 constexpr float BR_MIN = K0 * BR_STEP;
 constexpr float BR_MAX_ADULT = 45.0f, BR_MAX_INFANT = 78.0f;
 constexpr int NB_EXT_MAX = NFFT / 2 - K0;     // up to Nyquist (150 /min)

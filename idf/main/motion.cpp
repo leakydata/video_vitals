@@ -106,6 +106,7 @@ void TileMotion::process_yuyv(const uint8_t *px, int w, int h, uint32_t t_ms, bo
     out.t_ms = t_ms;
     out.valid = 0;
     out.jump = 0;
+    out.subject = 0;
     out.gross = external_motion;
     if (!have_ref_) {
         std::memcpy(ref_row_, cur_row_, sizeof(ref_row_));
@@ -143,6 +144,25 @@ void TileMotion::process_yuyv(const uint8_t *px, int w, int h, uint32_t t_ms, bo
             }
         }
     }
+    // Tiles overlapping a face-anchored box hold the subject; the rest are
+    // background, and breathing has no business coming from there.
+    for (int i = 0; i < kBoxes; i++) {
+        const Box &b = boxes[i];
+        if (!b.valid()) continue;
+        const int tw = w / GRID_X, th = h / GRID_Y;
+        for (int ty = 0; ty < GRID_Y; ty++)
+            for (int tx = 0; tx < GRID_X; tx++) {
+                const int x0 = tx * tw, y0 = ty * th;
+                const int ox = std::min(x0 + tw, b.x + b.w) - std::max(x0, (int)b.x);
+                const int oy = std::min(y0 + th, b.y + b.h) - std::max(y0, (int)b.y);
+                if (ox > tw / 4 && oy > th / 4) {  // a decent part of the tile is on the subject
+                    const int t = ty * GRID_X + tx;
+                    out.subject |= (1ull << (2 * t)) | (1ull << (2 * t + 1));
+                }
+            }
+        out.subject |= (1ull << (kBoxChan0 + 2 * i)) | (1ull << (kBoxChan0 + 2 * i + 1));
+    }
+
     // Face-anchored boxes (chest, head): they follow the subject instead of
     // relying on whichever fixed tile they happen to occupy.
     for (int i = 0; i < kBoxes; i++) {
