@@ -122,7 +122,9 @@ static int run(const Scenario &sc, unsigned seed)
                 frame[(y * W + x) * 2 + 1] = p & 0xff;
             }
         MotionSample ms;
-        tm.process_rgb565be(frame.data(), W, H, uint32_t(t * 1000), false, ms);
+        // the firmware anchors this under the detected face; the rendered chest is at x 70-250, y >= 130
+        const Box boxes[kBoxes] = {{70, 130, 180, 100}, {120, 30, 80, 100}};  // chest, head
+        tm.process_rgb565be(frame.data(), W, H, uint32_t(t * 1000), false, boxes, ms);
         buf.push(ms);
 
         if (t >= next) {
@@ -148,6 +150,84 @@ static int run(const Scenario &sc, unsigned seed)
     std::printf("  %-36s seed=%u  mean_err_last15s=%5.2f  locked=%3ds  %s\n", sc.name, seed, err / checks, locked,
                 ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
+}
+
+// Direct MotionSample feeds for the failure modes found in review: skipped
+// motion flags, aliasing, constant input, timestamp precision and a stalled
+// camera. None of these may produce a locked breathing rate.
+static int feed_tests()
+{
+    struct Case {
+        const char *name;
+        float fps;
+        uint32_t t0;
+        std::function<float(float, int)> disp;    // displacement (px) per time and channel
+        std::function<bool(float)> gross;
+        std::function<bool(float)> jump;
+        float stale_after;
+        bool expect_lock;
+        float rate;                               // expected rate when expect_lock
+    };
+    const std::vector<Case> cases = {
+        // real breathing, but the newest sample stops arriving after 45 s
+        {"stalled camera", 11.1f, 0, [](float t, int) { return 0.5f * std::sin(2 * M_PI * 15 / 60 * t); },
+         [](float) { return false; }, [](float) { return false; }, 45, false, 0},
+        // 4-pixel steps every 2 s, flagged, but falling between 5 Hz grid points
+        {"flagged steps between grid points", 16.0f, 0,
+         [](float t, int) { return 4.0f * std::floor(t / 2); },
+         [](float t) { return std::fmod(t, 2.0f) < 1.0f / 16; }, [](float) { return false; }, 0, false, 0},
+        // fast motion that aliases into the breathing band when point-sampled
+        {"4.7 Hz motion (aliasing)", 11.1f, 0, [](float t, int) { return 0.5f * std::sin(2 * M_PI * 4.7f * t); },
+         [](float) { return false; }, [](float) { return false; }, 0, false, 0},
+        // a perfectly constant, large displacement
+        {"constant 10000.1 px", 11.1f, 0, [](float, int) { return 10000.1f; },
+         [](float) { return false; }, [](float) { return false; }, 0, false, 0},
+        // real breathing after 25 days of uptime
+        {"15/min after 25 days uptime", 11.1f, 2147483647u,
+         [](float t, int) { return 0.5f * std::sin(2 * M_PI * 15 / 60 * t); },
+         [](float) { return false; }, [](float) { return false; }, 0, true, 15},
+    };
+    int fails = 0;
+    for (const auto &c : cases) {
+        static Buffer buf;
+        static Estimator est;
+        static MotionSample tmp[kCap];
+        buf.clear();
+        est.reset();
+        std::mt19937 rng(1);
+        std::normal_distribution<float> g(0, 0.01f);
+        float t = 0, next = 1;
+        int locked = 0, checks = 0;
+        float err = 0;
+        while (t < 80) {
+            t += 1 / c.fps;
+            MotionSample ms{};
+            ms.t_ms = c.t0 + uint32_t(t * 1000);
+            ms.valid = 0xFFFFFFFFu;
+            ms.gross = c.gross(t);
+            ms.jump = c.jump(t) ? 0xFFFFFFFFu : 0;
+            for (int ch = 0; ch < kChan; ch++) ms.d[ch] = c.disp(t, ch) + g(rng);
+            const bool frozen = c.stale_after > 0 && t > c.stale_after;
+            if (!frozen) buf.push(ms);
+            if (t >= next) {
+                next += 1;
+                const int n = buf.copy(tmp);
+                const Result r = est.update(tmp, n, ms.t_ms);
+                const bool lk = r.state == rppg::LOCKED;
+                if (lk) locked++;
+                if (t > 40) {
+                    checks++;
+                    // locks before a stall are legitimate; only a stale lock counts
+                    if (!c.expect_lock && lk && (c.stale_after == 0 || t > c.stale_after + 3)) err += 1;
+                    if (c.expect_lock && (!lk || std::fabs(r.brpm - c.rate) > 1.5f)) err += 1;
+                }
+            }
+        }
+        const bool ok = err <= checks / 10;
+        std::printf("  %-36s locked=%3ds  bad=%2.0f/%d  %s\n", c.name, locked, err, checks, ok ? "PASS" : "FAIL");
+        fails += !ok;
+    }
+    return fails;
 }
 
 int main(int argc, char **argv)
@@ -180,7 +260,7 @@ int main(int argc, char **argv)
             if (std::string(s.name).find(argv[2]) != std::string::npos) f.push_back(s);
         sc = f;
     }
-    int fails = 0, total = 0;
+    int fails = feed_tests(), total = 5;
     for (auto &s : sc)
         for (int seed = 1; seed <= seeds; seed++) {
             fails += run(s, seed);

@@ -13,25 +13,39 @@ namespace resp {
 
 constexpr int GRID_X = 4, GRID_Y = 4;
 constexpr int kTiles = GRID_X * GRID_Y;
-constexpr int kChan = 2 * kTiles;  // per tile: vertical, horizontal displacement
+// Channels: two per tile (vertical, horizontal), plus two per face-anchored
+// box. Box 0 is the chest (under the face), box 1 the head: breathing moves
+// the chest most, but head motion carries it too when the chest is hidden.
+constexpr int kBoxes = 2;
+constexpr int kChan = 2 * kTiles + 2 * kBoxes;
+constexpr int kBoxChan0 = 2 * kTiles;   // channel of box 0, vertical (then horizontal)
 constexpr int kMaxProf = 64;       // max profile length
+constexpr int kBoxProf = 48;       // profile bins across a box (whatever its size)
+
+struct Box {
+    int16_t x, y, w, h;
+    bool valid() const { return w > 16 && h > 16; }
+};
 
 struct MotionSample {
     uint32_t t_ms;
     float d[kChan];   // displacement in pixels; channel 2*i = tile i vertical, 2*i+1 horizontal
-    uint32_t valid;   // bit per channel: tile has enough texture
-    uint32_t jump;    // bit per channel: this channel moved too much this frame (local movement)
+    uint64_t valid;   // bit per channel: tile has enough texture (34 channels: 64-bit mask)
+    uint64_t jump;    // bit per channel: this channel moved too much this frame (local movement)
     bool gross;       // large movement of the whole scene (not breathing)
 };
 
 class TileMotion {
 public:
     // Frame is RGB565 big-endian (as captured by esp32-camera), w x h.
-    void process_rgb565be(const uint8_t *px, int w, int h, uint32_t t_ms, bool external_motion, MotionSample &out);
-    void reset() { have_ref_ = false; }
+    // `boxes` are the face-anchored boxes (chest, head); pass invalid Boxes for none.
+    void process_rgb565be(const uint8_t *px, int w, int h, uint32_t t_ms, bool external_motion,
+                          const Box boxes[kBoxes], MotionSample &out);
+    void reset() { have_ref_ = false; for (bool &b : have_box_) b = false; }
 
 private:
     void profiles(const uint8_t *px, int w, int h);
+    void box_profiles(const uint8_t *px, int w, int h, const Box &b, int i);
 
     int rows_ = 0, cols_ = 0;  // profile lengths
     bool have_ref_ = false;
@@ -39,6 +53,10 @@ private:
     float ref_row_[kTiles][kMaxProf], ref_col_[kTiles][kMaxProf];
     float off_[kChan] = {};    // displacement accumulated at re-keying
     float last_[kChan] = {};   // previous displacement (for gross motion)
+    float cur_brow_[kBoxes][kBoxProf], cur_bcol_[kBoxes][kBoxProf];
+    float ref_brow_[kBoxes][kBoxProf], ref_bcol_[kBoxes][kBoxProf];
+    Box box_ref_[kBoxes] = {};   // the box each reference profile belongs to
+    bool have_box_[kBoxes] = {};
 };
 
 } // namespace resp

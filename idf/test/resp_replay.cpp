@@ -5,6 +5,7 @@
 // Build: g++ -O2 -std=c++17 -I../main resp_replay.cpp ../main/motion.cpp ../main/resp.cpp -o resp_replay
 // Usage: video_frames.py clip.mp4 | resp_replay [--infant]
 //        resp_replay --motion recording.bin [--infant]
+//        video_frames.py clip.mp4 | resp_replay --chest x,y,w,h
 #include "motion.hpp"
 #include "resp.hpp"
 
@@ -39,9 +40,15 @@ static void feed(const MotionSample &ms)
 int main(int argc, char **argv)
 {
     const char *motion_file = nullptr;
+    Box boxes[kBoxes] = {};
     for (int i = 1; i < argc; i++) {
         if (!std::strcmp(argv[i], "--infant")) est.set_band(Band::INFANT);
         else if (!std::strcmp(argv[i], "--motion") && i + 1 < argc) motion_file = argv[++i];
+        else if (!std::strcmp(argv[i], "--chest") && i + 1 < argc) {
+            int x, y, w, h;
+            if (std::sscanf(argv[++i], "%d,%d,%d,%d", &x, &y, &w, &h) == 4)
+                boxes[0] = {int16_t(x), int16_t(y), int16_t(w), int16_t(h)};
+        }
     }
     std::printf("t,br,raw,snr,q,stab,agree,state,motion,channels,best\n");
 
@@ -53,7 +60,8 @@ int main(int argc, char **argv)
             if (p == std::string::npos) continue;
             std::istringstream ss(line.substr(p + 2));
             MotionSample ms{};
-            unsigned long t, valid, jump;
+            unsigned long t;
+            unsigned long long valid, jump;
             int gross;
             if (!(ss >> t >> valid >> jump >> gross)) continue;
             bool ok = true;
@@ -85,7 +93,7 @@ int main(int argc, char **argv)
         frame.resize(size_t(w) * h * 2);
         if (std::fread(frame.data(), 1, frame.size(), stdin) != frame.size()) break;
         MotionSample ms;
-        tm.process_rgb565be(frame.data(), w, h, t, false, ms);
+        tm.process_rgb565be(frame.data(), w, h, t, false, boxes, ms);
         feed(ms);
     }
     return 0;

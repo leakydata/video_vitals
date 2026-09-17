@@ -31,6 +31,8 @@ import serial.tools.list_ports
 from scipy.signal import butter, sosfiltfilt
 
 FS = 20.0
+N_CHAN = 36             # 16 tiles x 2 axes + chest and head boxes (vertical, horizontal)
+META_END = 12 + 30 * 2  # magic + length + timestamp + metadata
 
 
 ESPRESSIF_VID = 0x303A
@@ -61,11 +63,15 @@ class Device(threading.Thread):
         self.motion = deque(maxlen=600)  # (t, displacements[32], valid mask, gross)
         self.running = True
         self.rec = open(record, "wb") if record else None
+        self.marks = open(record + ".marks.txt", "w") if record else None
 
     def mark(self, text):
-        """Write an annotation line into the recording."""
-        if self.rec:
-            self.rec.write(("\n# viewer " + text + "\n").encode())
+        """Note an annotation beside the recording, never inside it: the
+        recording is a byte-exact copy of the serial stream, so text inserted
+        between chunks would land inside a JPEG or split a telemetry line."""
+        if self.marks:
+            self.marks.write(f"{time.time():.3f} {text}\n")
+            self.marks.flush()
 
     def send(self, cmd, startup=False):
         if startup:
@@ -104,9 +110,9 @@ class Device(threading.Thread):
             self.rr = dict(re.findall(r"(\w+)=([\w.\-]+)", line))
         elif line.startswith("M "):
             v = line.split()
-            if len(v) == 37:
+            if len(v) == 4 + N_CHAN:
                 try:
-                    self.motion.append((int(v[1]) / 1000.0, np.array(v[5:], float), int(v[2]), int(v[4])))
+                    self.motion.append((int(v[1]) / 1000.0, np.array(v[4:], float), int(v[2]), int(v[3])))
                 except ValueError:
                     pass
         elif line.startswith("S "):
@@ -161,17 +167,24 @@ class Device(threading.Thread):
                     if nl >= 0:
                         self._text(buf[: nl + 1])
                     buf = buf[j:]
-                if len(buf) < 64:
+                if len(buf) < META_END:
                     break
                 n, t = struct.unpack("<II", buf[4:12])
                 if n > 200_000:
                     buf = buf[4:]
                     continue
-                if len(buf) < 64 + n:
+                if len(buf) < META_END + n:
                     break
-                meta = struct.unpack("<26h", buf[12:64])
-                self.frames.append((t / 1000.0, meta, buf[64 : 64 + n]))
-                buf = buf[64 + n :]
+                meta = struct.unpack("<30h", buf[12:META_END])
+                jpg = buf[META_END : META_END + n]
+                # A frame abandoned mid-write (USB timeout) would otherwise eat
+                # the telemetry that follows it: accept only a complete JPEG and
+                # resynchronise on the next marker otherwise.
+                if jpg[:2] == b"\xff\xd8" and jpg[-2:] == b"\xff\xd9":
+                    self.frames.append((t / 1000.0, meta, jpg))
+                    buf = buf[META_END + n :]
+                else:
+                    buf = buf[4:]
 
     def close(self):
         self.running = False
@@ -184,6 +197,8 @@ class Device(threading.Thread):
                 self.ser.close()
             if self.rec:
                 self.rec.close()
+            if self.marks:
+                self.marks.close()
 
 
 def pos_pulse(samples, seconds=10.0):
@@ -251,8 +266,15 @@ def breathing_wave(motion, ch, seconds=30.0):
     return sosfiltfilt(sos, x)
 
 
+def draw_chest(img, meta):
+    x, y, w, h = meta[26:30]
+    if x >= 0 and w > 0:
+        cv2.rectangle(img, (x, y), (x + w, y + h), (255, 255, 0), 1)
+        cv2.putText(img, "chest", (x + 3, y + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+
+
 def draw_tile(img, ch, color):
-    if ch < 0:
+    if ch < 0 or ch >= 32:  # the chest/head channels have their own boxes
         return
     t = ch // 2
     tx, ty = t % 4, t // 4
@@ -336,7 +358,8 @@ def main():
                     last_t = t
                     left = frame.copy()
                     draw_overlay(left, meta)
-                    draw_tile(left, int(dev.rr.get("best", -1)), (255, 255, 0))
+                    draw_tile(left, int(dev.rr.get("best", -1)), (255, 200, 0))
+                    draw_chest(left, meta)
                     right = mag(frame, dt) if magnify else frame
                     view = cv2.resize(np.hstack([left, right]), None, fx=args.scale, fy=args.scale)
             if view is None:

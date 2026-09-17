@@ -19,6 +19,7 @@ def main():
     ap.add_argument("video")
     ap.add_argument("--target-fps", type=float, default=11.1, help="drop frames to mimic the device (0 = all)")
     ap.add_argument("--max-seconds", type=float, default=0)
+    ap.add_argument("--crop", help="x,y,w,h in source pixels (before scaling): zoom in on the subject")
     args = ap.parse_args()
     cap = cv2.VideoCapture(args.video)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
@@ -36,6 +37,9 @@ def main():
             if t + 1e-6 < next_keep:
                 continue
             next_keep += 1 / args.target_fps
+        if args.crop:
+            cx, cy, cw, ch = (int(v) for v in args.crop.split(","))
+            frame = frame[cy:cy + ch, cx:cx + cw]
         h, w = frame.shape[:2]
         if w * 3 > h * 4:  # crop to 4:3
             cw = h * 4 // 3

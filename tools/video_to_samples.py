@@ -30,6 +30,11 @@ def rgb565(frame_bgr):
     return r, g, b
 
 
+def lround(v):
+    """C++ lround(): halfway cases away from zero (Python round() is ties-to-even)."""
+    return int(math.floor(v + 0.5)) if v >= 0 else -int(math.floor(-v + 0.5))
+
+
 def face_rois(box, eye_l, eye_r, mouth):
     """Same placement as main.cpp face_rois()."""
     dx, dy = eye_r[0] - eye_l[0], eye_r[1] - eye_l[1]
@@ -54,8 +59,8 @@ def face_rois(box, eye_l, eye_r, mouth):
         if max(0, cx1 - cx0) * max(0, cy1 - cy0) < 0.5 * w * h:
             out.append((0, 0, 0, 0))
             continue
-        x0, y0 = round(cx0), round(cy0)
-        out.append((x0, y0, round(cx1) - x0, round(cy1) - y0))
+        x0, y0 = lround(cx0), lround(cy0)
+        out.append((x0, y0, lround(cx1) - x0, lround(cy1) - y0))
     return out
 
 

@@ -82,8 +82,28 @@ void TileMotion::profiles(const uint8_t *px, int w, int h)
     }
 }
 
+// Profiles of a box of any size, sampled into a fixed number of bins so the
+// tracker behaves the same however large the box is.
+void TileMotion::box_profiles(const uint8_t *px, int w, int h, const Box &b, int i)
+{
+    for (int k = 0; k < kBoxProf; k++) { cur_brow_[i][k] = 0; cur_bcol_[i][k] = 0; }
+    for (int r = 0; r < kBoxProf; r++) {
+        const int y = b.y + (r * b.h) / kBoxProf;
+        if (y < 0 || y >= h) continue;
+        const uint8_t *row = px + y * w * 2;
+        for (int c = 0; c < kBoxProf; c++) {
+            const int x = b.x + (c * b.w) / kBoxProf;
+            if (x < 0 || x >= w) continue;
+            const uint16_t v = (row[x * 2] << 8) | row[x * 2 + 1];
+            const int Y = 77 * (((v >> 11) & 0x1f) << 3) + 150 * (((v >> 5) & 0x3f) << 2) + 29 * ((v & 0x1f) << 3);
+            cur_brow_[i][r] += Y;
+            cur_bcol_[i][c] += Y;
+        }
+    }
+}
+
 void TileMotion::process_rgb565be(const uint8_t *px, int w, int h, uint32_t t_ms, bool external_motion,
-                                  MotionSample &out)
+                                  const Box boxes[kBoxes], MotionSample &out)
 {
     profiles(px, w, h);
     out.t_ms = t_ms;
@@ -115,10 +135,10 @@ void TileMotion::process_rgb565be(const uint8_t *px, int w, int h, uint32_t t_ms
             const bool jumped = std::fabs(disp - last_[ch]) > JUMP_STEP;
             last_[ch] = disp;
             out.d[ch] = disp * STEP;
-            out.valid |= 1u << ch;
+            out.valid |= 1ull << ch;
             if (jumped) {
                 jumps++;
-                out.jump |= 1u << ch;
+                out.jump |= 1ull << ch;
             }
             if (jumped || std::fabs(d) > REKEY) {
                 off_[ch] = disp;
@@ -126,6 +146,57 @@ void TileMotion::process_rgb565be(const uint8_t *px, int w, int h, uint32_t t_ms
             }
         }
     }
+    // Face-anchored boxes (chest, head): they follow the subject instead of
+    // relying on whichever fixed tile they happen to occupy.
+    for (int i = 0; i < kBoxes; i++) {
+        const Box &b = boxes[i];
+        if (!b.valid()) {
+            have_box_[i] = false;
+            continue;
+        }
+        box_profiles(px, w, h, b, i);
+        const bool moved = !have_box_[i] || std::abs(b.x - box_ref_[i].x) > 2 || std::abs(b.y - box_ref_[i].y) > 2 ||
+                           std::abs(b.w - box_ref_[i].w) > 2 || std::abs(b.h - box_ref_[i].h) > 2;
+        if (moved) {
+            // the box moved: its old reference means nothing, and the step that
+            // causes must not be read as breathing
+            std::memcpy(ref_brow_[i], cur_brow_[i], sizeof(ref_brow_[i]));
+            std::memcpy(ref_bcol_[i], cur_bcol_[i], sizeof(ref_bcol_[i]));
+            box_ref_[i] = b;
+            have_box_[i] = true;
+            for (int axis = 0; axis < 2; axis++) {
+                const int ch = kBoxChan0 + 2 * i + axis;
+                out.jump |= 1ull << ch;
+                off_[ch] = last_[ch];
+            }
+        }
+        for (int axis = 0; axis < 2; axis++) {
+            const int ch = kBoxChan0 + 2 * i + axis;
+            float *ref = axis == 0 ? ref_brow_[i] : ref_bcol_[i];
+            const float *cur = axis == 0 ? cur_brow_[i] : cur_bcol_[i];
+            // bins span the box, so convert the shift to pixels using its size
+            const float px_per_bin = float(axis == 0 ? b.h : b.w) / kBoxProf;
+            float d;
+            if (!lk_shift(ref, cur, kBoxProf, d)) {
+                std::memcpy(ref, cur, sizeof(float) * kBoxProf);
+                out.d[ch] = off_[ch] * px_per_bin;
+                continue;
+            }
+            const float disp = off_[ch] + d;
+            if (std::fabs(disp - last_[ch]) > JUMP_STEP) {
+                jumps++;
+                out.jump |= 1ull << ch;
+            }
+            last_[ch] = disp;
+            out.d[ch] = disp * px_per_bin;
+            out.valid |= 1ull << ch;
+            if (std::fabs(d) > REKEY) {
+                off_[ch] = disp;
+                std::memcpy(ref, cur, sizeof(float) * kBoxProf);
+            }
+        }
+    }
+
     if (jumps >= GROSS_CHANNELS) out.gross = true;
     if (out.gross) {
         // after a big movement the old references are meaningless

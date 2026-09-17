@@ -10,13 +10,15 @@ Contactless heart rate (rPPG) and breathing rate on a XIAO ESP32-S3 Sense
   - `main/rppg.cpp` — estimator: POS (or mono/IR) per ROI → Butterworth
     bandpass → spectra → SNR-weighted fusion → harmonic/octave check →
     quality (SNR × peak stability × cross-ROI coherence) → gated Kalman tracker
-  - `main/motion.cpp` — breathing motion: 4x4 tile grid, row/column
-    luminance profiles, 1-D Lucas-Kanade sub-pixel shifts, local/global
-    movement flags
-  - `main/resp.cpp` — breathing estimator: per-tile resampling, per-segment
-    detrend, motion masks, bandpass, FFT, best-channel fusion, octave check,
-    quality (SNR x stability x channel agreement)
-  - `main/tracker.hpp` — Kalman rate tracker shared by both estimators
+  - `main/motion.cpp` — breathing motion: 4x4 tile grid plus face-anchored
+    chest and head boxes, row/column luminance profiles, 1-D Lucas-Kanade
+    sub-pixel shifts, local/global movement flags
+  - `main/resp.cpp` — breathing estimator: anti-aliased resampling, per-segment
+    detrend, per-channel and whole-scene motion masks, bandpass, FFT,
+    channel fusion (chest box preferred), octave check, quality
+    (SNR x stability x channel agreement)
+  - `main/tracker.hpp` — Kalman rate tracker shared by both estimators, plus
+    wraparound-safe timestamp arithmetic, staleness limit and octave resolution
   - `test/test_rppg.cpp` — heart-rate scenario tests
   - `test/test_resp.cpp` — breathing tests on rendered frames
   - `test/replay.cpp`, `test/resp_replay.cpp` — run the estimators on
@@ -70,11 +72,18 @@ colour) and `M` (tile displacement) lines.
     g++ -O2 -std=c++17 -I../main test_resp.cpp ../main/motion.cpp ../main/resp.cpp -o test_resp && ./test_resp
     g++ -O2 -std=c++17 -I../main resp_replay.cpp ../main/motion.cpp ../main/resp.cpp -o resp_replay
 
+Reviewed by Codex (gpt-6-astra) at commit 0b1051c; all 11 findings addressed or
+covered by a regression test (timestamp precision, octave errors, skipped motion
+flags, aliasing, stale buffers, constant-input locks, task synchronisation,
+frame desync, recording annotations, test strictness, host rounding parity).
+
 Current results:
-- Heart rate: synthetic 80/80; UBFC subject 1 (device-equivalent, 11 fps):
+- Heart rate: synthetic 105/105 (including 25-day uptime, harmonic-dominant
+  pulses, stalled camera); UBFC subject 1 (device-equivalent, 11 fps):
   locked 100%, MAE 1.7 bpm against the current HR; matched a KardiaMobile 6L
   live. (MPU-rPPG sample unused: its PPG and HR columns disagree.)
-- Breathing: synthetic 36/36 (rendered frames: 0.15 px chest motion, 6-45/min,
+- Breathing: synthetic 41/41 (rendered frames plus direct feeds for skipped
+  motion flags, 4.7 Hz aliasing, constant input, timestamps, stalls: 0.15 px chest motion, 6-45/min,
   infant band, rate changes, flicker, local and whole-scene movement, no
   false locks). AIR-400 infant clips are **not** solved: at 320x240 the
   compressed night-vision videos show no usable chest motion in any tile, and

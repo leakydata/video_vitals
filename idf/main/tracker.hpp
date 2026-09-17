@@ -10,6 +10,83 @@ namespace rppg {
 
 enum State : uint8_t { NO_SIGNAL = 0, ACQUIRING = 1, LOCKED = 2 };
 
+// Signed millisecond difference a - b. Timestamps are uint32 milliseconds of
+// uptime: never convert them to float before subtracting (a float holds only
+// ~7 digits, so resolution decays as uptime grows) and this also survives the
+// 49.7-day wraparound.
+inline float ms_diff(uint32_t a, uint32_t b)
+{
+    return float(int32_t(a - b));
+}
+
+// A window whose newest sample is older than this is stale: the camera stalled
+// or frames stopped arriving, and no rate may be reported from it.
+constexpr float STALE_MS = 2000.0f;
+
+// Normalised autocorrelation of x at a fractional lag (samples). A periodic
+// signal correlates best at its true period, even when its second harmonic is
+// stronger in the spectrum, so this resolves octave ambiguity where the
+// spectrum alone cannot.
+inline float autocorr(const float *x, int n, float lag)
+{
+    const int L = int(lag);
+    if (L < 1 || L >= n - 4) return 0;
+    const float u = lag - L;
+    double num = 0, e0 = 0, e1 = 0;
+    for (int i = 0; i + L + 1 < n; i++) {
+        const float y = x[i + L] + u * (x[i + L + 1] - x[i + L]);
+        num += x[i] * y;
+        e0 += x[i] * x[i];
+        e1 += y * y;
+    }
+    const double den = std::sqrt(e0 * e1);
+    return den > 0 ? float(num / den) : 0;
+}
+
+// Resolve octave ambiguity for a spectral peak. `p_at(rate)` returns the fused
+// spectral power at a rate. A candidate replaces the spectral peak only when it
+// both has real spectral support and correlates clearly better in the waveform,
+// so noise cannot halve a correct high rate.
+#ifndef OCTAVE_SUPPORT
+#define OCTAVE_SUPPORT 0.03f   // spectral power a rival octave needs, relative to the peak
+#endif
+#ifndef OCTAVE_MARGIN
+#define OCTAVE_MARGIN 0.20f    // how much better it must repeat in the waveform
+#endif
+#ifndef OCTAVE_AMBIG
+#define OCTAVE_AMBIG 0.08f     // rival power (relative to the peak) that makes the octave doubtful
+#endif
+
+struct Octave {
+    float rate;       // chosen rate
+    bool ambiguous;   // a rival octave had support but no clear winner
+};
+
+// Resolve octave ambiguity for a spectral peak: report a rate only when the
+// waveform agrees. A signal whose 2nd harmonic dominates the spectrum still
+// repeats only at its true (longer) period; a genuinely fast rate repeats at
+// its own short period. `p_at(rate)` gives the fused spectral power at a rate.
+template <typename PowerAt>
+inline Octave resolve_octave(const float *wave, int n, float fs, float rate, float lo, float hi, PowerAt p_at)
+{
+    const float r0 = autocorr(wave, n, 60.0f * fs / rate);
+    const float p0 = p_at(rate);
+    Octave out{rate, false};
+    const float half = rate / 2, dbl = rate * 2;
+    if (half >= lo && p_at(half) > OCTAVE_SUPPORT * p0) {
+        const float rh = autocorr(wave, n, 60.0f * fs / half);
+        if (rh > r0 + OCTAVE_MARGIN) out.rate = half;
+        // a strong rival that the waveform cannot separate: report nothing confident
+        else if (p_at(half) > OCTAVE_AMBIG * p0) out.ambiguous = true;
+    }
+    if (out.rate == rate && dbl <= hi && p_at(dbl) > p0) {
+        const float rd = autocorr(wave, n, 60.0f * fs / dbl);
+        if (rd > r0 + OCTAVE_MARGIN) out.rate = dbl;
+        else out.ambiguous = true;
+    }
+    return out;
+}
+
 struct TrackerParams {
     float process_noise;  // rate^2 per second of allowed drift
     float gate_min;       // minimum innovation gate (rate units)
@@ -39,7 +116,7 @@ public:
     // Grow the uncertainty for the time elapsed since the last call.
     void predict(uint32_t now_ms)
     {
-        const float dt = (has_ && last_ms_) ? (now_ms - last_ms_) / 1000.0f : 0;
+        const float dt = (has_ && last_ms_) ? ms_diff(now_ms, last_ms_) / 1000.0f : 0;
         last_ms_ = now_ms;
         if (has_) var_ += p_.process_noise * dt;
     }

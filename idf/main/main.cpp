@@ -12,7 +12,8 @@
 //                   "M t valid jump gross d0..d31" (tile displacements),
 //                   "# log"; binary frames:
 //                   'H','C','F','2' | u32 len | u32 t_ms | i16 meta[26] | jpeg
-//                   meta = face box x1,y1,x2,y2 | 5 landmarks (x,y) | 3 ROIs x,y,w,h
+//                   meta = face box x1,y1,x2,y2 | 5 landmarks (x,y) | 3 ROIs x,y,w,h |
+//                          chest box x,y,w,h
 //                   (-1 when absent)
 //   host -> device  one command per line:
 //     s/x stream on/off     v/w per-frame samples on/off
@@ -37,6 +38,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+
+#include <atomic>
 
 #include "dl_image_jpeg.hpp"
 #include "human_face_detect.hpp"
@@ -135,14 +138,15 @@ static struct {
     float cam_fps = 0, det_fps = 0, det_ms = 0, det_hit = 0;
     rppg::Result res{};
     resp::Result rr{};
+    SemaphoreHandle_t mtx;  // guards res/rr (written by hr, read by led)
 } stats;
 
 // detector / stream frame handoff
 static uint8_t *det_frame, *str_frame;
 static uint32_t str_t_ms;
-static int16_t str_meta[26];
+static int16_t str_meta[30];  // face box, 5 landmarks, 3 ROIs, chest box
 static SemaphoreHandle_t det_sem, str_sem;
-static volatile bool det_busy = false, str_busy = false;
+static std::atomic<bool> det_busy{false}, str_busy{false};
 
 // ---------------------------------------------------------------- camera
 static void apply_flip();
@@ -224,6 +228,27 @@ static void apply_flip()
     const bool base_vflip = s->id.PID == OV3660_PID;
     s->set_vflip(s, base_vflip ^ cfg.flipped);
     s->set_hmirror(s, cfg.flipped);
+}
+
+// Chest box: below the face, about twice its width. Breathing moves it far more
+// than it moves the face, so it is the best place to measure when a face is
+// visible; the tile grid covers the rest (and the no-face case).
+static resp::Box chest_box(const Face &f)
+{
+    const float fw = f.box[2] - f.box[0], fh = f.box[3] - f.box[1];
+    if (fw < 20 || fh < 20) return {0, 0, 0, 0};
+    const float want_w = 2.2f * fw, want_h = 1.2f * fh;
+    const float cx = (f.box[0] + f.box[2]) / 2;
+    // slide the box inside the frame before clipping, so a face near an edge
+    // still gets a usable chest box
+    float x0 = std::clamp(cx - want_w / 2, 0.0f, std::max(0.0f, W - want_w));
+    float y0 = std::clamp(f.box[3] + 0.15f * fh, 0.0f, std::max(0.0f, H - want_h));
+    const float x1 = std::min<float>(x0 + want_w, W), y1 = std::min<float>(y0 + want_h, H);
+    const resp::Box b{int16_t(std::lround(x0)), int16_t(std::lround(y0)), int16_t(std::lround(x1 - x0)),
+                      int16_t(std::lround(y1 - y0))};
+    // too little of it left (face at the very bottom of the frame): no chest box
+    if (b.w < 0.5f * want_w || b.h < 0.4f * want_h || b.w < 40 || b.h < 30) return {0, 0, 0, 0};
+    return b;
 }
 
 // ---------------------------------------------------------------- ROIs
@@ -391,7 +416,15 @@ static void cam_task(void *)
         }
 
         resp::MotionSample ms;
-        g_tiles->process_rgb565be(fb->buf, W, H, t_ms, now < f.motion_until_us, ms);
+        resp::Box boxes[resp::kBoxes] = {};
+        if (face_ok) {
+            boxes[0] = chest_box(f);
+            // head box: the face box itself, which breathing also moves slightly
+            const int16_t hx = int16_t(std::lround(f.box[0])), hy = int16_t(std::lround(f.box[1]));
+            boxes[1] = {hx, hy, int16_t(std::lround(f.box[2]) - hx), int16_t(std::lround(f.box[3]) - hy)};
+        }
+        const resp::Box &chest = boxes[0];
+        g_tiles->process_rgb565be(fb->buf, W, H, t_ms, now < f.motion_until_us, boxes, ms);
 
         xSemaphoreTake(buf_mtx, portMAX_DELAY);
         g_buf->push(s);
@@ -402,9 +435,9 @@ static void cam_task(void *)
             out_printf("S %lu %.2f %.2f %.2f %u %.2f %.2f %.2f %u %.2f %.2f %.2f %u %d\n", (unsigned long)t_ms,
                        s.roi[0].r, s.roi[0].g, s.roi[0].b, s.roi[0].n, s.roi[1].r, s.roi[1].g, s.roi[1].b,
                        s.roi[1].n, s.roi[2].r, s.roi[2].g, s.roi[2].b, s.roi[2].n, s.motion);
-            char line[400];
-            int len = snprintf(line, sizeof(line), "M %lu %lu %lu %d", (unsigned long)t_ms, (unsigned long)ms.valid,
-                               (unsigned long)ms.jump, ms.gross);
+            char line[640];
+            int len = snprintf(line, sizeof(line), "M %lu %llu %llu %d", (unsigned long)t_ms,
+                               (unsigned long long)ms.valid, (unsigned long long)ms.jump, ms.gross);
             for (int c = 0; c < resp::kChan && len < (int)sizeof(line) - 12; c++)
                 len += snprintf(line + len, sizeof(line) - len, " %.3f", ms.d[c]);
             line[len++] = '\n';
@@ -433,6 +466,10 @@ static void cam_task(void *)
                     str_meta[16 + 4 * i] = held[i].w;
                     str_meta[17 + 4 * i] = held[i].h;
                 }
+            str_meta[26] = chest.valid() ? chest.x : -1;
+            str_meta[27] = chest.valid() ? chest.y : -1;
+            str_meta[28] = chest.valid() ? chest.w : -1;
+            str_meta[29] = chest.valid() ? chest.h : -1;
             str_busy = true;
             xSemaphoreGive(str_sem);
         }
@@ -596,9 +633,14 @@ static void hr_task(void *)
         xSemaphoreGive(buf_mtx);
         g_est->set_mode(cfg.mono ? rppg::Mode::MONO : rppg::Mode::RGB);
         const int64_t t0 = esp_timer_get_time();
-        const rppg::Result r = n ? g_est->update(tmp, n, tmp[n - 1].t_ms) : rppg::Result{};
+        // "now" must be the wall clock, not the newest sample: otherwise a
+        // stalled camera looks like a perfectly fresh window forever
+        const uint32_t now_ms = esp_timer_get_time() / 1000;
+        const rppg::Result r = n ? g_est->update(tmp, n, now_ms) : rppg::Result{};
         const float ms = (esp_timer_get_time() - t0) / 1000.0f;
+        xSemaphoreTake(stats.mtx, portMAX_DELAY);
         stats.res = r;
+        xSemaphoreGive(stats.mtx);
         bool face;
         xSemaphoreTake(face_mtx, portMAX_DELAY);
         face = g_face.valid && esp_timer_get_time() - g_face.t_us < FACE_HOLD_US;
@@ -611,9 +653,11 @@ static void hr_task(void *)
 
         g_rest->set_band(cfg.infant ? resp::Band::INFANT : resp::Band::ADULT);
         const int64_t t1 = esp_timer_get_time();
-        const resp::Result rr = rn ? g_rest->update(rtmp, rn, rtmp[rn - 1].t_ms) : resp::Result{};
+        const resp::Result rr = rn ? g_rest->update(rtmp, rn, now_ms) : resp::Result{};
         const float rms = (esp_timer_get_time() - t1) / 1000.0f;
+        xSemaphoreTake(stats.mtx, portMAX_DELAY);
         stats.rr = rr;
+        xSemaphoreGive(stats.mtx);
         out_printf("RR br=%.1f raw=%.1f snr=%.1f q=%.2f stab=%.2f agree=%.2f state=%s motion=%.2f ch=%d best=%d "
                    "band=%s est_ms=%.0f\n",
                    rr.brpm, rr.raw, rr.snr_db, rr.quality, rr.stability, rr.agreement, state_name(rr.state), rr.motion,
@@ -643,7 +687,9 @@ static void led_task(void *)
 {
     int64_t last_beat = 0;
     for (;;) {
+        xSemaphoreTake(stats.mtx, portMAX_DELAY);
         const rppg::Result r = stats.res;
+        xSemaphoreGive(stats.mtx);
         const int64_t now = esp_timer_get_time();
         if (r.state == rppg::LOCKED && r.bpm > 30) {
             const int64_t period = int64_t(60e6f / r.bpm);
@@ -725,6 +771,7 @@ static void cmd_task(void *)
 extern "C" void app_main(void)
 {
     out_mtx = xSemaphoreCreateMutex();
+    stats.mtx = xSemaphoreCreateMutex();
     face_mtx = xSemaphoreCreateMutex();
     buf_mtx = xSemaphoreCreateMutex();
     det_sem = xSemaphoreCreateBinary();

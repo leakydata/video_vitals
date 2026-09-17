@@ -142,15 +142,19 @@ void Estimator::reset()
 // whole window. Returns the masked fraction.
 float Estimator::motion_mask(const Sample *s, int n)
 {
-    const float t_end = s[n - 1].t_ms;
-    const float t_start = t_end - WINDOW_S * 1000;
+    const uint32_t t_end = s[n - 1].t_ms;
     const float step = 1000.0f / FS;
+    const float t_start = -WINDOW_S * 1000;  // offsets relative to the newest sample
     bool m[N] = {};
     int k = 0;
     for (int i = 0; i < N; i++) {
-        const float t = t_start + i * step;
-        while (k + 1 < n && s[k + 1].t_ms <= t) k++;
-        m[i] = s[k].motion || (k + 1 < n && s[k + 1].motion);
+        const float lo = t_start + (i - 0.5f) * step, hi = lo + step;
+        while (k < n && ms_diff(s[k].t_ms, t_end) < lo) k++;
+        // every sample falling in this grid interval counts (frames can arrive
+        // faster than the grid, and a flag must never be skipped)
+        for (int j = k; j < n && ms_diff(s[j].t_ms, t_end) < hi; j++)
+            if (s[j].motion) m[i] = true;
+        if (k > 0 && s[k - 1].motion) m[i] = true;  // the sample just before, too
     }
     constexpr int DIL = int(0.3f * FS), TAPER = int(0.4f * FS);
     float masked = 0;
@@ -169,8 +173,8 @@ float Estimator::motion_mask(const Sample *s, int n)
 bool Estimator::resample(const Sample *s, int n, int roi)
 {
     if (n < 2) return false;
-    const float t_end = s[n - 1].t_ms;
-    const float t_start = t_end - WINDOW_S * 1000;
+    const uint32_t t_end = s[n - 1].t_ms;
+    const float t_start = -WINDOW_S * 1000;  // offsets relative to the newest sample
     const float step = 1000.0f / FS;
 
     // anchor: last valid sample at or before the window start (else the first
@@ -178,33 +182,34 @@ bool Estimator::resample(const Sample *s, int n, int roi)
     int j = -1;
     for (int k = 0; k < n; k++) {
         if (!s[k].roi[roi].n) continue;
-        if (s[k].t_ms <= t_start) {
+        if (ms_diff(s[k].t_ms, t_end) <= t_start) {
             j = k;
         } else {
             if (j < 0) j = k;
             break;
         }
     }
-    if (j < 0 || s[j].t_ms > t_start + 1000) return false;
+    if (j < 0 || ms_diff(s[j].t_ms, t_end) > t_start + 1000) return false;
 
     int a = j;
     for (int i = 0; i < N; i++) {
         const float t = t_start + i * step;
         // advance a to the last valid sample with time <= t
-        for (int k = a + 1; k < n && s[k].t_ms <= t; k++)
+        for (int k = a + 1; k < n && ms_diff(s[k].t_ms, t_end) <= t; k++)
             if (s[k].roi[roi].n) a = k;
         int b = a + 1;
         while (b < n && s[b].roi[roi].n == 0) b++;
         const RoiSample &ra = s[a].roi[roi];
         if (b >= n) {  // past the last valid sample: hold
-            if (t - s[a].t_ms > 1000) return false;
+            if (t - ms_diff(s[a].t_ms, t_end) > 1000) return false;
             c_[0][i] = ra.r; c_[1][i] = ra.g; c_[2][i] = ra.b;
             continue;
         }
         const RoiSample &rb = s[b].roi[roi];
-        const float dt = float(s[b].t_ms) - float(s[a].t_ms);
+        const float ta = ms_diff(s[a].t_ms, t_end), tb = ms_diff(s[b].t_ms, t_end);
+        const float dt = tb - ta;
         if (dt > 1000) return false;  // gap too long
-        float u = dt > 0 ? (t - s[a].t_ms) / dt : 0;
+        float u = dt > 0 ? (t - ta) / dt : 0;
         u = u < 0 ? 0 : (u > 1 ? 1 : u);
         c_[0][i] = ra.r + u * (rb.r - ra.r);
         c_[1][i] = ra.g + u * (rb.g - ra.g);
@@ -284,6 +289,12 @@ void Estimator::spectrum(const float *x, float *P)
 Result Estimator::update(const Sample *samples, int n, uint32_t now_ms)
 {
     Result r{};
+    // a window whose newest sample is old means capture stalled: report nothing
+    if (n < 2 || ms_diff(now_ms, samples[n - 1].t_ms) > STALE_MS) {
+        r.state = NO_SIGNAL;
+        trk_.no_signal();
+        return r;  // no usable window: report nothing, not the last tracked value
+    }
     float fused[NB_EXT] = {};
     float wsum = 0, best_w = -1;
     int used = 0;
@@ -320,8 +331,7 @@ Result Estimator::update(const Sample *samples, int n, uint32_t now_ms)
     if (!used) {
         r.state = NO_SIGNAL;
         trk_.no_signal();
-        r.bpm = trk_.x();
-        return r;
+        return r;  // no usable window: report nothing, not the last tracked value
     }
     for (int k = 0; k < NB_EXT; k++) fused[k] /= wsum;
     r.motion = masked;
@@ -331,20 +341,28 @@ Result Estimator::update(const Sample *samples, int n, uint32_t now_ms)
     const bool tracking = trk_.tracking();
     for (int k = 0; k < NB; k++) {
         const int k2 = 2 * k + int(BPM_MIN / BPM_STEP);
-        // A pulse's 2nd harmonic is weaker than its fundamental. If the power at
-        // 2f exceeds that at f, the real rate is probably 2f: penalise f
-        // instead of crediting it (avoids octave errors).
+        // Credit power at the 2nd harmonic to the fundamental (capped, so a
+        // half-rate candidate cannot inherit the real peak). Which octave is
+        // right is settled on the waveform below, not here.
         const float h2 = k2 < NB_EXT ? fused[k2] : 0;
-        F[k] = h2 <= fused[k] ? fused[k] + 0.5f * h2 : 0.5f * fused[k];
+        F[k] = fused[k] + 0.5f * std::fmin(h2, fused[k]);
         if (tracking) {
             const float d = (bin_bpm(k) - trk_.x()) / 15.0f;
             F[k] *= 0.3f + 0.7f * std::exp(-0.5f * d * d);
         }
     }
     const int kb = argmax(F, NB);
-    const float z = bin_bpm(parabolic(F, kb, NB));
+    float z = bin_bpm(parabolic(F, kb, NB));
+    // octave check on the waveform: a strong 2nd harmonic must not be reported
+    // as the rate, nor a sub-harmonic of it
+    const Octave oct = resolve_octave(pulse_, N, FS, z, BPM_MIN, BPM_MAX, [&](float bpm) {
+        const int k = std::clamp(int((bpm - BPM_MIN) / BPM_STEP + 0.5f), 0, NB_EXT - 1);
+        return fused[k];
+    });
+    z = oct.rate;
     r.bpm_raw = z;
-    r.snr_db = snr_at(fused, kb);
+    const int kz = std::clamp(int((z - BPM_MIN) / BPM_STEP + 0.5f), 0, NB - 1);
+    r.snr_db = snr_at(fused, kz);
     // quality = SNR score x peak stability: a real pulse stays put from
     // window to window, noise peaks wander
     r.stability = trk_.stability(z);
@@ -370,6 +388,8 @@ Result Estimator::update(const Sample *samples, int n, uint32_t now_ms)
     // hysteresis: coherence is required to acquire a lock, not to keep one
     const float q_keep = q_snr * (0.25f + 0.75f * r.stability);
     r.quality = trk_.good_streak() >= 4 ? std::fmax(q_keep, q_keep * q_coh) : q_keep * q_coh;
+    // an unresolved octave is not worth locking on: halve the confidence
+    if (oct.ambiguous) r.quality *= 0.5f;
 
     trk_.update(z, r.quality, r.motion < MOTION_MAX);
     r.state = trk_.locked() ? LOCKED : ACQUIRING;
