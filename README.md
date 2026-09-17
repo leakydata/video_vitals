@@ -39,6 +39,8 @@ PC viewer is optional.
 - `tools/radar_ref.py` — live comparison against a Seeed MR60BHA2 radar (independent
   breathing/heart reference); finds both boards by probing the USB serial ports
 - `tools/session_report.py` — plots a recording: rates, quality, motion, pacer marks
+- `tools/noise_bench.py` — measures the noise floor (frame rate, tracker jitter,
+  ROI colour noise, exposure/brightness) to compare cameras, lenses or settings
 - `heartcam.py` — PC viewer (video + overlays, Eulerian magnification, pulse plot)
 - `data/` — public test videos (see `data/SOURCES.md`)
 - `firmware/heart_cam/` — first Arduino prototype (superseded)
@@ -86,6 +88,17 @@ Reviewed by Codex (gpt-6-astra) at commit 0b1051c; all 11 findings addressed or
 covered by a regression test (timestamp precision, octave errors, skipped motion
 flags, aliasing, stale buffers, constant-input locks, task synchronisation,
 frame desync, recording annotations, test strictness, host rounding parity).
+
+Camera comparison (same scene, `tools/noise_bench.py`):
+
+| sensor | frame rate | tracker noise | white balance |
+|---|---|---|---|
+| OV3660 (stock, ~78 deg) | 14.8 fps | 0.039 px/frame | lockable (manual AWB gains) |
+| OV2640-V3 (66 deg) | 10.8 fps | 0.076 px/frame | automatic only |
+
+The OV3660 wins on every axis; an OV2640 cannot hold a fixed white balance with
+this driver, which matters because every AWB adjustment shifts the colours the
+pulse is measured from. Prefer OV3660/OV5640 modules, including for night vision.
 
 Measurements (device-side unless stated):
 - YUV422 instead of RGB565 halved the tracker noise floor (0.060 -> 0.029 px of

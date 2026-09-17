@@ -56,9 +56,9 @@ static constexpr int CAM_VSYNC = 38, CAM_HREF = 47, CAM_PCLK = 13;
 static constexpr gpio_num_t LED_PIN = GPIO_NUM_21;  // active low
 
 static constexpr int W = 320, H = 240;
-static constexpr float JUMP_MOTION = 0.04f;
-static constexpr uint16_t MIN_ROI_PIXELS = 40;
-static constexpr float FACE_MOTION = 0.35f;  // face-widths per second counted as movement  // relative frame-to-frame ROI brightness change flagged as motion
+static constexpr float JUMP_MOTION = 0.04f;   // relative frame-to-frame ROI brightness change counted as movement
+static constexpr uint16_t MIN_ROI_PIXELS = 40;  // below this an ROI mean is mostly noise
+static constexpr float FACE_MOTION = 0.35f;   // face-widths per second counted as movement
 static constexpr int64_t FACE_HOLD_US = 2500000;  // keep using the last face this long after a miss
 
 // ---------------------------------------------------------------- output
@@ -136,6 +136,7 @@ static struct {
 
 static struct {
     float cam_fps = 0, det_fps = 0, det_ms = 0, det_hit = 0;
+    int brightness = 0;  // mean luminance of the frame centre
     rppg::Result res{};
     resp::Result rr{};
     SemaphoreHandle_t mtx;  // guards res/rr (written by hr, read by led)
@@ -218,8 +219,12 @@ static void auto_then_lock(int ms)
         s->set_reg(s, 0x3406, 0x01, 0x01);
         ESP_LOGI(TAG, "AWB gains R=%d G=%d B=%d (x1024)", (g[0] << 8) | g[1], (g[2] << 8) | g[3], (g[4] << 8) | g[5]);
     } else {
-        s->set_whitebal(s, 0);
-        s->set_awb_gain(s, 0);
+        // Other sensors (e.g. OV2640) have no readable AWB gains, and turning
+        // the AWB block off drops white balance entirely (a green image). Leave
+        // it on: its drift is slow, and POS normalises each channel anyway.
+        s->set_whitebal(s, 1);
+        s->set_awb_gain(s, 1);
+        ESP_LOGI(TAG, "AWB left automatic (no manual gains on sensor 0x%04x)", s->id.PID);
     }
     xSemaphoreTake(buf_mtx, portMAX_DELAY);
     g_buf->clear();
@@ -365,6 +370,14 @@ static void cam_task(void *)
         camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) continue;
         const uint32_t t_ms = fb->timestamp.tv_sec * 1000ULL + fb->timestamp.tv_usec / 1000;
+        {
+            // mean luminance of the frame centre: tells us whether a comparison
+            // between cameras or lenses was made in comparable light
+            uint32_t sum = 0, cnt = 0;
+            for (int y = H / 4; y < 3 * H / 4; y += 4)
+                for (int x = W / 4; x < 3 * W / 4; x += 4) { sum += fb->buf[(y * W + x) * 2]; cnt++; }
+            stats.brightness = cnt ? sum / cnt : 0;
+        }
         const int64_t now = esp_timer_get_time();
 
         Face f;
@@ -764,9 +777,12 @@ static void handle_command(char *line)
         out_printf("# breathing band %s\n", cfg.infant ? "infant (6-78/min)" : "adult (6-45/min)");
         break;
     case 'i':
+        // exposure and gain matter when comparing cameras or lenses: a fair
+        // comparison needs both sensors to have settled on similar light
         out_printf("# heart_cam idf PID=0x%04x stream=%d samples=%d mode=%s cam_fps=%.1f det_fps=%.1f "
-                   "psram_free=%u int_free=%u\n",
+                   "exposure=%d gain=%d bright=%d psram_free=%u int_free=%u\n",
                    s->id.PID, cfg.stream, cfg.samples, cfg.mono ? "mono" : "rgb", stats.cam_fps, stats.det_fps,
+                   s->status.aec_value, s->status.agc_gain, stats.brightness,
                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         break;
