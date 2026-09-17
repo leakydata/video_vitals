@@ -137,6 +137,8 @@ static struct {
 static struct {
     float cam_fps = 0, det_fps = 0, det_ms = 0, det_hit = 0;
     int brightness = 0;  // mean luminance of the frame centre
+    float roi_level = 0; // mean of the brightest channel of the skin ROIs
+    float roi_clip = 0;  // fraction of ROI pixels at or near saturation
     rppg::Result res{};
     resp::Result rr{};
     SemaphoreHandle_t mtx;  // guards res/rr (written by hr, read by led)
@@ -346,6 +348,7 @@ static void cam_task(void *)
     float gain[rppg::kRois][3] = {{1, 1, 1}, {1, 1, 1}, {1, 1, 1}};
     rppg::RoiSample prev[rppg::kRois] = {};
     int64_t jump_until = 0;
+    int64_t last_relock = 0;
 
     for (;;) {
         if (cfg.relock) {
@@ -415,8 +418,14 @@ static void cam_task(void *)
                 std::memcpy(held, rois, sizeof(held));
                 have_held = true;
             }
+            float level = 0;
+            int levels = 0;
             for (int i = 0; i < nroi; i++) {
                 rppg::RoiSample m = roi_mean(fb->buf, held[i], cfg.mono);
+                if (m.n) {
+                    level += std::max(m.r, std::max(m.g, m.b));
+                    levels++;
+                }
                 m.r *= gain[i][0];
                 m.g *= gain[i][1];
                 m.b *= gain[i][2];
@@ -433,6 +442,21 @@ static void cam_task(void *)
                 s.roi[i] = m;
             }
             s.motion = s.motion || now < jump_until;
+            if (levels) {
+                const float lvl = level / levels;
+                stats.roi_level = stats.roi_level > 0 ? 0.98f * stats.roi_level + 0.02f * lvl : lvl;
+                // Exposure is frozen at boot so that automatic adjustments cannot
+                // imitate a pulse. If the light has since changed enough to clip
+                // the skin (or leave it in the dark), that costs far more than a
+                // re-exposure does, so redo it - at most every 30 s.
+                const bool bad = stats.roi_level > 205 || stats.roi_level < 45;
+                if (bad && now - last_relock > 30000000 && !cfg.relock) {
+                    ESP_LOGI(TAG, "skin level %.0f: re-running auto exposure", stats.roi_level);
+                    cfg.relock = true;
+                    last_relock = now;
+                    stats.roi_level = 0;
+                }
+            }
         } else {
             have_held = false;
             for (auto &p : prev) p.n = 0;
@@ -679,9 +703,9 @@ static void hr_task(void *)
         face = g_face.valid && esp_timer_get_time() - g_face.t_us < FACE_HOLD_US;
         xSemaphoreGive(face_mtx);
         out_printf("HR bpm=%.1f raw=%.1f snr=%.1f q=%.2f stab=%.2f coh=%.2f state=%s motion=%.2f "
-                   "rois=%d face=%d det_hit=%.2f fps=%.1f det_fps=%.1f det_ms=%.0f est_ms=%.0f mode=%s\n",
+                   "rois=%d face=%d det_hit=%.2f skin_lvl=%.0f fps=%.1f det_fps=%.1f det_ms=%.0f est_ms=%.0f mode=%s\n",
                    r.bpm, r.bpm_raw, r.snr_db, r.quality, r.stability, r.coherence, state_name(r.state),
-                   r.motion, r.rois_used, face, stats.det_hit, stats.cam_fps, stats.det_fps, stats.det_ms, ms,
+                   r.motion, r.rois_used, face, stats.det_hit, stats.roi_level, stats.cam_fps, stats.det_fps, stats.det_ms, ms,
                    cfg.mono ? "mono" : "rgb");
 
         g_rest->set_band(cfg.infant ? resp::Band::INFANT : resp::Band::ADULT);

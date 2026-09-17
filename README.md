@@ -130,10 +130,18 @@ Current results:
   area are tolerated; movement of the whole scene pauses the estimate.
 - A 30 s window: the first rate appears ~30-40 s after sitting still.
 
-## Getting a good reading
-- Face 30–60 cm away, well lit, **still** (rest the module on something).
-- Steady light: no flicker, no screen light changing on the face.
-- Exposure and white balance lock at boot. If the lighting changes, press `a`.
+## Getting a good reading (heart rate)
+- Face 30–60 cm away, **still** (rest the module on something).
+- **Even, indirect light on the face.** The pulse is a ~0.3% colour change, so:
+  - direct sun or a bright lamp clips the skin and throws that change away;
+  - glancing light adds surface glare, which carries no pulse and dilutes it;
+  - a window behind you leaves your face dark while the sensor exposes for the view;
+  - changing light (cloud, or a monitor whose content changes) drifts at the
+    rates we are looking for.
+  A lamp bounced off a wall or ceiling is close to ideal.
+- Exposure and white balance are locked at boot so their adjustments cannot
+  imitate a pulse. The device re-exposes itself if the skin level clips or goes
+  dark (`skin_lvl` in the `HR` line, ~120-160 is healthy); press `a` to force it.
 - The rate is reported once the tracker is `locked` (needs ~15 s).
 
 ## Roadmap
