@@ -22,6 +22,15 @@ inline float ms_diff(uint32_t a, uint32_t b)
 // A window whose newest sample is older than this is stale: the camera stalled
 // or frames stopped arriving, and no rate may be reported from it.
 constexpr float STALE_MS = 2000.0f;
+#ifndef LOCK_Q
+#define LOCK_Q 0.5f      // quality that counts a window as good
+#endif
+#ifndef LOCK_RUN
+#define LOCK_RUN 4       // consecutive good windows needed to report a reading
+#endif
+#ifndef LOCK_STRONG
+#define LOCK_STRONG 0.85f  // a window this good counts double: clear evidence
+#endif
 
 // Normalised autocorrelation of x at a fractional lag (samples). A periodic
 // signal correlates best at its true period, even when its second harmonic is
@@ -111,7 +120,7 @@ public:
     int good_streak() const { return good_; }
     bool tracking() const { return has_ && good_ >= 2; }
     // locked: enough good updates, and not currently in a run of rejected ones
-    bool locked() const { return has_ && good_ >= 4 && bad_ <= 3; }
+    bool locked() const { return has_ && good_ >= LOCK_RUN && bad_ <= 3; }
 
     // Grow the uncertainty for the time elapsed since the last call.
     void predict(uint32_t now_ms)
@@ -160,8 +169,11 @@ public:
                 }
             }
         }
-        if (accepted && quality >= 0.5f) {
-            good_++;
+        if (accepted && quality >= LOCK_Q) {
+            // Strong evidence counts double, so a clean signal is reported after
+            // about half as many windows, while a marginal one still has to
+            // prove itself over the full run.
+            good_ += quality >= LOCK_STRONG ? 2 : 1;
             bad_ = 0;
         } else if (!accepted) {
             bad_++;

@@ -12,7 +12,7 @@ The heart rate is computed on the ESP32. This viewer shows:
 
 Keys: q quit | m magnification | a re-auto-expose | r rotate 180
       +/- exposure | M toggle mono(IR) mode | b adult/infant breathing band
-      p breathing pacer on/off, [ ] pacer rate | s snapshot
+      p breathing pacer on/off, [ ] pacer rate | z sensor zoom | s snapshot
 
 The pacer rate can also be set from outside while the viewer runs, by writing a
 number (or "off") to the file given by --pacer-file, e.g.
@@ -37,6 +37,7 @@ import serial.tools.list_ports
 from scipy.signal import butter, sosfiltfilt
 
 FS = 20.0
+WINDOW = "video_vitals"
 N_CHAN = 36             # 16 tiles x 2 axes + chest and head boxes (vertical, horizontal)
 META_END = 12 + 30 * 2  # magic + length + timestamp + metadata
 
@@ -332,6 +333,20 @@ def draw_plot(img, x, y, w, h, data, color, label):
     cv2.putText(img, label, (x + 5, y + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
 
+def screen_width():
+    """Usable screen width, or None if it cannot be determined."""
+    try:
+        import subprocess
+        out = subprocess.run(["xrandr"], capture_output=True, text=True, timeout=3).stdout
+        widths = [int(m) for m in re.findall(r"connected primary (\d+)x", out)] or \
+                 [int(m) for m in re.findall(r"connected (\d+)x", out)]
+        if widths:
+            return min(widths)
+    except Exception:
+        pass
+    return None
+
+
 def fmt_status(hr):
     return (f"{hr.get('state', '?')}  q={hr.get('q', '?')} snr={hr.get('snr', '?')}dB "
             f"stab={hr.get('stab', '?')} coh={hr.get('coh', '?')} motion={hr.get('motion', '?')}")
@@ -340,8 +355,11 @@ def fmt_status(hr):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", default="auto", help="serial port (default: find the ESP32 by USB id)")
-    ap.add_argument("--scale", type=float, default=2.0, help="display scale")
+    ap.add_argument("--scale", type=float, default=0, help="display scale (0 = fit to screen)")
+    ap.add_argument("--single", action="store_true", help="one video feed only (no magnified view)")
     ap.add_argument("--alpha", type=float, default=60.0, help="magnification factor")
+    ap.add_argument("--max-width", type=int, default=0, help="largest window width (0 = detect the screen)")
+    ap.add_argument("--pos", default="60,60", help="window position x,y (multi-monitor desktops can hide it)")
     ap.add_argument("--headless", action="store_true", help="no window; print the device heart rate")
     ap.add_argument("--no-video", action="store_true", help="do not stream video (faster on-device fps)")
     ap.add_argument("--seconds", type=float, default=0, help="stop after N seconds")
@@ -350,6 +368,20 @@ def main():
     ap.add_argument("--pacer-file", default="/tmp/heartcam_pacer",
                     help="write a rate (or 'off') to this file to change the pacer while running")
     args = ap.parse_args()
+
+    # Fit the window to the screen: two 320-wide feeds plus the panel is 1280x810
+    # at 2x, which overflows many displays.
+    scale = args.scale
+    if not scale:
+        width = args.max_width or screen_width() or 1280
+        feeds = 1 if args.single else 2
+        scale = max(1.0, min(2.5, (width - 80) / (320 * feeds)))
+    print(f"[viewer] display scale {scale:.2f}")
+
+    try:
+        args.pos = tuple(int(v) for v in args.pos.split(","))
+    except ValueError:
+        args.pos = (60, 60)
 
     dev = Device(args.port, args.record)
     dev.send("v", startup=True)
@@ -362,6 +394,10 @@ def main():
     last_t = None
     last_print = 0
     view = None
+    # AUTOSIZE, not NORMAL: some window managers fail to map the resizable one.
+    cv2.namedWindow(WINDOW, cv2.WINDOW_AUTOSIZE)
+    cv2.moveWindow(WINDOW, *args.pos)            # a desktop spanning several screens can place it off-view
+    zoom = False
     pacer_on, pacer_rate, pacer_t0 = args.pacer > 0, args.pacer or 10.0, time.time()
     if pacer_on:
         dev.mark(f"pacer on rate={pacer_rate:.0f}")
@@ -410,10 +446,13 @@ def main():
                     draw_boxes(left, meta)
                     sel = [int(c) for c in dev.rr.get("sel", "").split(",") if c.strip().lstrip("-").isdigit()]
                     breathing_regions(left, meta, sel, int(dev.rr.get("best", -1)))
-                    right = mag(frame, dt) if magnify else frame
-                    view = cv2.resize(np.hstack([left, right]), None, fx=args.scale, fy=args.scale)
+                    if args.single:
+                        view = cv2.resize(left, None, fx=scale, fy=scale)
+                    else:
+                        right = mag(frame, dt) if magnify else frame
+                        view = cv2.resize(np.hstack([left, right]), None, fx=scale, fy=scale)
             if view is None:
-                view = np.zeros((int(240 * args.scale), int(640 * args.scale), 3), np.uint8)
+                view = np.zeros((int(240 * scale), int(320 * (1 if args.single else 2) * scale), 3), np.uint8)
                 msg = "video off" if args.no_video else "waiting for video..."
                 if not dev.connected:
                     msg = "board disconnected - waiting for it..."
@@ -421,51 +460,74 @@ def main():
                             (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
 
             W = view.shape[1]
-            panel = np.zeros((330, W, 3), np.uint8)
+            # The panel adapts to the window width: text and bars are placed in
+            # proportion, and a narrow view is padded so nothing is cut off.
+            PW = max(W, 560)
+            panel = np.zeros((300, PW, 3), np.uint8)
+            col2 = int(PW * 0.44)          # where the status column starts
+            small = 0.42 if PW < 700 else 0.5
             pulse = pos_pulse(list(dev.samples))
-            draw_plot(panel, 5, 5, W - 10, 95, pulse, (90, 90, 255), "pulse (POS on device samples, last 10 s)")
-            rr = dev.rr
+            rr, h = dev.rr, dev.hr
+            draw_plot(panel, 5, 5, PW - 10, 78, pulse, (90, 90, 255), "pulse (POS, last 10 s)")
             breath = breathing_wave(list(dev.motion), int(rr.get("best", -1)))
-            draw_plot(panel, 5, 195, W - 10, 80, breath, (255, 255, 0), "breathing (best tile displacement, last 30 s)")
-            rstate = rr.get("state", "")
-            rcol = {"locked": (255, 255, 80), "acquiring": (0, 200, 255)}.get(rstate, (120, 120, 120))
-            br = float(rr.get("br", 0) or 0)
-            cv2.putText(panel, f"{br:4.1f} /min" if br > 0 else "--.- /min", (10, 318),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, rcol, 3)
-            cv2.putText(panel, f"breathing {rstate}  q={rr.get('q', '?')} snr={rr.get('snr', '?')}dB "
-                               f"stab={rr.get('stab', '?')} agree={rr.get('agree', '?')} motion={rr.get('motion', '?')} "
-                               f"band={rr.get('band', '?')}",
-                        (300, 312), cv2.FONT_HERSHEY_SIMPLEX, 0.5, rcol, 1)
-            h = dev.hr
+            draw_plot(panel, 5, 170, PW - 10, 62, breath, (255, 255, 0), "breathing (best region, last 30 s)")
+
             state = h.get("state", "")
             bpm = float(h.get("bpm", 0) or 0)
             col = {"locked": (80, 255, 80), "acquiring": (0, 200, 255)}.get(state, (120, 120, 120))
-            big = f"{bpm:5.1f} bpm" if bpm > 0 else "--.- bpm"
-            cv2.putText(panel, big, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 1.5, col, 3)
-            cv2.putText(panel, fmt_status(h), (300, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
-            cv2.putText(panel, f"face={h.get('face')} det_hit={h.get('det_hit')} rois={h.get('rois')} "
-                               f"cam {h.get('fps')} fps  det {h.get('det_ms')} ms  mode={h.get('mode')}  "
-                               f"mag={'on' if magnify else 'off'}",
-                        (300, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+            # Only a locked estimate is shown as a reading. While acquiring, the
+            # number is the device's working guess, shown small and greyed: it
+            # has not passed the quality checks and should not be read as a
+            # measurement.
+            locked = state == "locked"
+            cv2.putText(panel, f"{bpm:5.1f} bpm" if locked and bpm > 0 else "--.- bpm", (10, 135),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.1, col if locked else (90, 90, 90), 2)
+            if not locked and float(h.get("raw", 0) or 0) > 0:
+                cv2.putText(panel, f"(working: {float(h['raw']):.0f})", (12, 155),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (110, 110, 110), 1)
+            cv2.putText(panel, f"{state}  q={h.get('q', '?')} snr={h.get('snr', '?')}dB", (col2, 108),
+                        cv2.FONT_HERSHEY_SIMPLEX, small, col, 1)
+            cv2.putText(panel, f"stab={h.get('stab', '?')} coh={h.get('coh', '?')} motion={h.get('motion', '?')}",
+                        (col2, 128), cv2.FONT_HERSHEY_SIMPLEX, small, col, 1)
+            cv2.putText(panel, f"{'ZOOM ' if zoom else ''}face={h.get('face')} rois={h.get('rois')} "
+                               f"{h.get('fps')}fps  skin={h.get('skin_lvl', '?')}",
+                        (col2, 148), cv2.FONT_HERSHEY_SIMPLEX, small, (170, 170, 170), 1)
             try:
                 q = float(h.get("q", 0))
             except ValueError:
                 q = 0
-            cv2.rectangle(panel, (300, 162), (300 + int(300 * q), 176), col, -1)
-            cv2.rectangle(panel, (300, 162), (600, 176), (90, 90, 90), 1)
+            bar_w = PW - col2 - 20
+            cv2.rectangle(panel, (col2, 155), (col2 + int(bar_w * q), 165), col, -1)
+            cv2.rectangle(panel, (col2, 155), (col2 + bar_w, 165), (90, 90, 90), 1)
+
+            rstate = rr.get("state", "")
+            rcol = {"locked": (255, 255, 80), "acquiring": (0, 200, 255)}.get(rstate, (120, 120, 120))
+            br = float(rr.get("br", 0) or 0)
+            rlocked = rstate == "locked"
+            cv2.putText(panel, f"{br:4.1f} /min" if rlocked and br > 0 else "--.- /min", (10, 288),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, rcol if rlocked else (90, 90, 90), 2)
+            if not rlocked and float(rr.get("raw", 0) or 0) > 0:
+                cv2.putText(panel, f"(working: {float(rr['raw']):.0f})", (12, 298 - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (110, 110, 110), 1)
+            cv2.putText(panel, f"{rstate}  q={rr.get('q', '?')} snr={rr.get('snr', '?')}dB", (col2, 262),
+                        cv2.FONT_HERSHEY_SIMPLEX, small, rcol, 1)
+            cv2.putText(panel, f"agree={rr.get('agree', '?')} motion={rr.get('motion', '?')} "
+                               f"band={rr.get('band', '?')}",
+                        (col2, 282), cv2.FONT_HERSHEY_SIMPLEX, small, rcol, 1)
             if pacer_on:
                 phase = ((time.time() - pacer_t0) * pacer_rate / 60.0) % 1.0
                 size = 0.5 - 0.5 * np.cos(2 * np.pi * phase)  # grows (inhale) then shrinks (exhale)
-                cx, cy = W - 110, 90
-                cv2.circle(view, (cx, cy), int(20 + 60 * size), (255, 200, 80), 3)
-                label = "breathe IN" if phase < 0.5 else "breathe OUT"
-                cv2.putText(view, f"{label}  pacer {pacer_rate:.0f}/min", (cx - 105, cy + 105),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 80), 2)
-                cv2.putText(panel, f"pacer {pacer_rate:.0f}/min", (W - 220, 318), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                            (255, 200, 80), 2)
+                cx, cy = view.shape[1] - 90, 80
+                cv2.circle(view, (cx, cy), int(15 + 45 * size), (255, 200, 80), 3)
+                cv2.putText(view, "breathe IN" if phase < 0.5 else "breathe OUT", (cx - 85, cy + 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 80), 2)
+                cv2.putText(panel, f"pacer {pacer_rate:.0f}/min", (col2, 300 - 4), cv2.FONT_HERSHEY_SIMPLEX,
+                            small, (255, 200, 80), 1)
             if state == "locked" and pulse is not None and pulse[-1] > 0:
-                cv2.circle(panel, (W - 30, 140), 14, (60, 60, 255), -1)
-            cv2.imshow("heart_cam", np.vstack([view, panel]))
+                cv2.circle(panel, (PW - 22, 128), 11, (60, 60, 255), -1)
+            if PW > W:   # pad a narrow video to the panel width so nothing is clipped
+                view = cv2.copyMakeBorder(view, 0, 0, 0, PW - W, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+            cv2.imshow(WINDOW, np.vstack([view, panel]))
 
             key = cv2.waitKey(15) & 0xFF
             if key == ord("q"):
@@ -484,6 +546,9 @@ def main():
                 pacer_rate = float(np.clip(pacer_rate + (1 if key == ord("]") else -1), 4, 40))
                 pacer_t0 = time.time()
                 dev.mark(f"pacer {'on' if pacer_on else 'off'} rate={pacer_rate:.0f} t={time.time():.3f}")
+            elif key == ord("z"):
+                zoom = not zoom
+                dev.send("z1" if zoom else "z0")
             elif key == ord("b"):
                 dev.send("b1" if dev.rr.get("band") != "infant" else "b0")
             elif key == ord("M"):

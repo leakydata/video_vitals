@@ -65,22 +65,29 @@ def face_rois(box, eye_l, eye_r, mouth):
 
 
 def roi_mean(r, g, b, roi, any_colour=False):
+    """Same as main.cpp roi_mean(): the box learns its own colour and keeps the
+    pixels that match it, instead of testing against a fixed skin-colour range."""
     x, y, w, h = roi
     if w < 4 or h < 4:
         return (0.0, 0.0, 0.0, 0)
     R, G, B = r[y:y + h, x:x + w].ravel(), g[y:y + h, x:x + w].ravel(), b[y:y + h, x:x + w].ravel()
-    ok = (R <= 244) & (G <= 248) & (B <= 244)
     Y = (77 * R + 150 * G + 29 * B) >> 8
-    ok &= Y >= 25
     Cr = ((128 * R - 107 * G - 21 * B) >> 8) + 128
     Cb = ((-43 * R - 85 * G + 128 * B) >> 8) + 128
-    skin = ok & (Cr >= 133) & (Cr <= 173) & (Cb >= 77) & (Cb <= 127)
-    n, an = int(skin.sum()), int(ok.sum())
-    if not any_colour and n >= an * 4 // 10 and n >= 16:
-        m = skin
-    elif any_colour and an >= 16:
+    lit = (Y >= 25) & (Y <= 250)
+    an = int(lit.sum())
+    if an < 16:
+        return (0.0, 0.0, 0.0, 0)
+    mcb, mcr = int(Cb[lit].mean()), int(Cr[lit].mean())
+    ok = lit & (R <= 250) & (G <= 250) & (B <= 250)
+    TOL = 14
+    same = ok & (np.abs(Cb - mcb) <= TOL) & (np.abs(Cr - mcr) <= TOL)
+    n = int(same.sum())
+    if not any_colour and n >= an // 3 and n >= 16:
+        m = same
+    elif int(ok.sum()) >= 16:
         m = ok
-        n = an
+        n = int(ok.sum())
     else:
         return (0.0, 0.0, 0.0, 0)
     return (R[m].mean(), G[m].mean(), B[m].mean(), min(n, 65535))

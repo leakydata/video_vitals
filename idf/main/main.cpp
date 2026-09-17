@@ -19,6 +19,7 @@
 //     s/x stream on/off     v/w per-frame samples on/off
 //     a   auto-expose 2 s then lock          e<n> exposure   g<n> gain
 //     q<n> JPEG quality (1-100)              m0/m1 RGB / mono(IR) mode
+//     z0/z1 sensor-window zoom off / follow the face
 //     b0/b1 breathing band adult (6-45/min) / infant (6-78/min)
 //     r   rotate image 180 degrees (also automatic when a face is upside down)
 //     i   info
@@ -128,6 +129,8 @@ static resp::TileMotion *g_tiles;
 
 static struct {
     bool stream = false, samples = false, mono = false, infant = false;
+    volatile bool zoom = false;      // follow the face with a sensor window
+    volatile bool zoom_reset = false;
     int quality = 80;
     volatile bool relock = false;
     volatile bool flip_request = false;  // rotate the sensor image 180 degrees
@@ -234,6 +237,35 @@ static void auto_then_lock(int ms)
     ESP_LOGI(TAG, "exposure/gain/white balance locked");
 }
 
+// ---------------------------------------------------------------- zoom
+// The sensor can read out a window of its array instead of the whole thing.
+// Cropping to the subject puts far more sensor pixels on the skin at the same
+// output size and frame rate — an electronic telephoto — which is what the
+// heart-rate signal is short of. Geometry from the driver's 4:3 table:
+// array 2048x1536, end margins +32/+12, offset 16,6, line length 2300.
+static constexpr int ARR_W = 2048, ARR_H = 1536, TOTAL_X = 2300;
+static struct { int x = 0, y = 0, w = ARR_W, h = ARR_H; } win;  // current sensor window
+
+static void apply_window(int cx, int cy, int cw)
+{
+    sensor_t *s = esp_camera_sensor_get();
+    if (!s->set_res_raw) return;
+    cw = std::clamp(cw, 4 * W, ARR_W);      // never zoom past 4x, never beyond the array
+    int ch = cw * H / W;
+    if (ch > ARR_H) { ch = ARR_H; cw = ch * W / H; }
+    cx = std::clamp(cx - cw / 2, 0, ARR_W - cw);
+    cy = std::clamp(cy - ch / 2, 0, ARR_H - ch);
+    const bool binning = cw >= 2 * W && ch >= 2 * H;
+    const int total_y = binning ? (ch + 28) / 2 + 1 : ch + 28;
+    if (s->set_res_raw(s, cx, cy, cx + cw - 1 + 32, cy + ch - 1 + 12, 16, 6, TOTAL_X, total_y, W, H, true,
+                       binning) != 0) {
+        ESP_LOGW(TAG, "window %dx%d at %d,%d rejected", cw, ch, cx, cy);
+        return;
+    }
+    win = {cx, cy, cw, ch};
+    ESP_LOGI(TAG, "sensor window %dx%d at %d,%d (%.1fx zoom)", cw, ch, cx, cy, float(ARR_W) / cw);
+}
+
 static void apply_flip()
 {
     sensor_t *s = esp_camera_sensor_get();
@@ -301,19 +333,44 @@ static int face_rois(const Face &f, Rect out[rppg::kRois])
     return rppg::kRois;
 }
 
-// Mean colour of a ROI from a YUYV frame: the skin test uses the sensor's own
-// chroma (Cb = U, Cr = V) and RGB is reconstructed at full 8-bit precision.
+// Mean colour of a ROI from a YUYV frame.
+//
+// The landmarks already place the box on skin, so rather than testing pixels
+// against a fixed "skin colour" range — which depends on the white balance and
+// is biased across skin tones — the box learns its own colour: take the mean
+// chroma of the well-exposed pixels, then keep those close to it. Hair,
+// glasses, shadow and background are outliers and drop out; skin does not,
+// whatever colour the light makes it.
 static rppg::RoiSample roi_mean(const uint8_t *px, const Rect &r, bool any_colour)
 {
     rppg::RoiSample out{0, 0, 0, 0};
     if (r.w < 4 || r.h < 4) return out;
-    uint32_t sr = 0, sg = 0, sb = 0, n = 0;       // skin-classified pixels
-    uint32_t ar = 0, ag = 0, ab = 0, an = 0;      // all non-clipped pixels
+
+    // pass 1: mean chroma of pixels that are neither clipped nor black
+    int32_t scb = 0, scr = 0;
+    uint32_t an = 0;
     for (int y = r.y; y < r.y + r.h; y++) {
         const uint8_t *row = px + y * W * 2;
         for (int x = r.x; x < r.x + r.w; x++) {
             const int Y = row[x * 2];
-            // chroma is shared by each pixel pair: U at the even sample, V at the odd
+            if (Y < 25 || Y > 250) continue;
+            const int cbase = (x & ~1) * 2;
+            scb += row[cbase + 1];
+            scr += row[cbase + 3];
+            an++;
+        }
+    }
+    if (an < 16) return out;
+    const int mcb = scb / int(an), mcr = scr / int(an);
+
+    // pass 2: average the pixels whose colour matches the box's own
+    constexpr int TOL = 14;  // chroma distance still counted as the same surface
+    uint32_t sr = 0, sg = 0, sb = 0, n = 0, ar = 0, ag = 0, ab = 0;
+    for (int y = r.y; y < r.y + r.h; y++) {
+        const uint8_t *row = px + y * W * 2;
+        for (int x = r.x; x < r.x + r.w; x++) {
+            const int Y = row[x * 2];
+            if (Y < 25 || Y > 250) continue;
             const int cbase = (x & ~1) * 2;
             const int Cb = row[cbase + 1], Cr = row[cbase + 3];
             const int cd = Cr - 128, ce = Cb - 128;
@@ -321,23 +378,46 @@ static rppg::RoiSample roi_mean(const uint8_t *px, const Rect &r, bool any_colou
             const int G = std::clamp(Y - ((22554 * ce + 46802 * cd) >> 16), 0, 255);
             const int B = std::clamp(Y + ((116130 * ce) >> 16), 0, 255);
             if (R > 250 || G > 250 || B > 250) continue;  // clipped / specular
-            if (Y < 25) continue;
-            ar += R; ag += G; ab += B; an++;
-            if (Cr < 133 || Cr > 173 || Cb < 77 || Cb > 127) continue;
+            ar += R; ag += G; ab += B;
+            if (std::abs(Cb - mcb) > TOL || std::abs(Cr - mcr) > TOL) continue;
             sr += R; sg += G; sb += B; n++;
         }
     }
-    // colour mode: an ROI that is mostly not skin (hair, background) is dropped.
-    // mono/IR mode has no usable colour, so all well-exposed pixels are used.
-    if (!any_colour && n >= an * 4 / 10 && n >= 16) {
+    if (!any_colour && n >= an / 3 && n >= 16) {
         out = {float(sr) / n, float(sg) / n, float(sb) / n, uint16_t(std::min<uint32_t>(n, 65535))};
-    } else if (any_colour && an >= 16) {
+    } else if (an >= 16) {
+        // mono/IR has no usable chroma, and a box whose colour is not uniform is
+        // better measured whole than not at all
         out = {float(ar) / an, float(ag) / an, float(ab) / an, uint16_t(std::min<uint32_t>(an, 65535))};
     }
     return out;
 }
 
 // ---------------------------------------------------------------- tasks
+// A window change is a discontinuity, not a reason to forget everything: the
+// breathing estimator needs 30 continuous seconds, so clearing its history on
+// every re-aim left it with nothing at all. Mark the affected frames as
+// movement instead — the masks already handle exactly this — and rebuild the
+// tile references.
+static int64_t break_until = 0;
+
+static void break_history(int64_t now)
+{
+    break_until = now + 1200000;  // ~1.2 s of samples marked as movement
+    g_tiles->reset();
+}
+
+// Exposure and white balance changes alter the measured colours outright, so
+// those do still discard the history.
+static void clear_history()
+{
+    xSemaphoreTake(buf_mtx, portMAX_DELAY);
+    g_buf->clear();
+    g_rbuf->clear();
+    xSemaphoreGive(buf_mtx);
+    g_tiles->reset();
+}
+
 static void cam_task(void *)
 {
     int frames = 0;
@@ -355,6 +435,11 @@ static void cam_task(void *)
             cfg.relock = false;
             auto_then_lock(2000);
         }
+        if (cfg.zoom_reset) {
+            cfg.zoom_reset = false;
+            apply_window(ARR_W / 2, ARR_H / 2, ARR_W);
+            break_history(esp_timer_get_time());
+        }
         if (cfg.flip_request) {
             cfg.flip_request = false;
             cfg.flipped = !cfg.flipped;
@@ -364,11 +449,7 @@ static void cam_task(void *)
                 camera_fb_t *old = esp_camera_fb_get();
                 if (old) esp_camera_fb_return(old);
             }
-            xSemaphoreTake(buf_mtx, portMAX_DELAY);
-            g_buf->clear();
-            g_rbuf->clear();
-            xSemaphoreGive(buf_mtx);
-            g_tiles->reset();
+            clear_history();
         }
         camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) continue;
@@ -391,7 +472,7 @@ static void cam_task(void *)
 
         rppg::Sample s{};
         s.t_ms = t_ms;
-        s.motion = now < f.motion_until_us;
+        s.motion = now < f.motion_until_us || now < break_until;
         int nroi = face_ok ? face_rois(f, rois) : 0;
         if (nroi) {
             // Dead-band: moving the ROI by a pixel changes which pixels are
@@ -462,6 +543,45 @@ static void cam_task(void *)
             for (auto &p : prev) p.n = 0;
         }
 
+        // Auto-zoom: crop the sensor to the subject once a face is settled, and
+        // widen again when it is lost. Rate-limited, and only for real changes,
+        // because every window change discards the measurement history.
+        if (cfg.zoom) {
+            static int64_t last_zoom = 0;
+            if (face_ok && now - last_zoom > 20000000) {  // re-aiming costs ~1 s of signal
+                const float fw = f.box[2] - f.box[0], fh = f.box[3] - f.box[1];
+                const float fcx = (f.box[0] + f.box[2]) / 2;
+                const float fcy = (f.box[1] + f.box[3]) / 2 + 0.6f * fh;  // bias down, to include the chest
+                // Face box -> sensor coordinates through the current window. The
+                // sensor may be mirroring and flipping what it reads out (the
+                // auto-rotation does exactly that), and the window is in sensor
+                // coordinates, so undo those first or the crop lands on the
+                // subject's mirror image.
+                sensor_t *sen = esp_camera_sensor_get();
+                const float ox = fcx * win.w / W, oy = fcy * win.h / H;
+                const int sx = win.x + int(sen->status.hmirror ? win.w - 1 - ox : ox);
+                const int sy = win.y + int(sen->status.vflip ? win.h - 1 - oy : oy);
+                const int want_w = std::max<int>(4 * W, int(3.2f * fw * win.w / W));
+                const bool moved = std::abs(sx - (win.x + win.w / 2)) > win.w / 3 ||
+                                   std::abs(sy - (win.y + win.h / 2)) > win.h / 3 ||
+                                   std::abs(want_w - win.w) > win.w / 2;
+                if (moved) {
+                    apply_window(sx, sy, want_w);
+                    break_history(now);
+                    last_zoom = now;
+                    for (int i = 0; i < 3; i++) {  // drop frames captured with the old window
+                        camera_fb_t *old = esp_camera_fb_get();
+                        if (old) esp_camera_fb_return(old);
+                    }
+                }
+            } else if (!face_ok && win.w < ARR_W && now - last_zoom > 5000000) {
+                ESP_LOGI(TAG, "face lost: widening the sensor window");
+                apply_window(ARR_W / 2, ARR_H / 2, ARR_W);
+                break_history(now);
+                last_zoom = now;
+            }
+        }
+
         resp::MotionSample ms;
         resp::Box boxes[resp::kBoxes] = {};
         if (face_ok) {
@@ -471,7 +591,7 @@ static void cam_task(void *)
             boxes[1] = {hx, hy, int16_t(std::lround(f.box[2]) - hx), int16_t(std::lround(f.box[3]) - hy)};
         }
         const resp::Box &chest = boxes[0];
-        g_tiles->process_yuyv(fb->buf, W, H, t_ms, now < f.motion_until_us, boxes, ms);
+        g_tiles->process_yuyv(fb->buf, W, H, t_ms, now < f.motion_until_us || now < break_until, boxes, ms);
 
         xSemaphoreTake(buf_mtx, portMAX_DELAY);
         g_buf->push(s);
@@ -795,6 +915,11 @@ static void handle_command(char *line)
     case 'm':
         cfg.mono = v != 0;
         out_printf("# mode %s\n", cfg.mono ? "mono" : "rgb");
+        break;
+    case 'z':
+        cfg.zoom = v != 0;
+        if (!cfg.zoom) cfg.zoom_reset = true;
+        out_printf("# zoom %s\n", cfg.zoom ? "auto (sensor window follows the face)" : "off (full field of view)");
         break;
     case 'b':
         cfg.infant = v != 0;
