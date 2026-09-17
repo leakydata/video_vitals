@@ -109,7 +109,7 @@ int Buffer::copy(Sample *out) const
 }
 
 // ------------------------------------------------------------------ Estimator
-Estimator::Estimator()
+Estimator::Estimator() : trk_({PROCESS_NOISE, 12.0f, 4.0f, 250.0f, 4.0f})
 {
     cos_ = new float[NB_EXT * N];
     sin_ = new float[NB_EXT * N];
@@ -132,10 +132,7 @@ Estimator::~Estimator()
 
 void Estimator::reset()
 {
-    have_x_ = false;
-    x_ = p_ = 0;
-    good_streak_ = bad_streak_ = outlier_streak_ = 0;
-    hist_n_ = hist_i_ = 0;
+    trk_.reset();
     std::memset(pulse_, 0, sizeof(pulse_));
 }
 
@@ -318,14 +315,12 @@ Result Estimator::update(const Sample *samples, int n, uint32_t now_ms)
     r.rois_used = used;
 
     // Kalman predict
-    float dt = (have_x_ && last_ms_) ? (now_ms - last_ms_) / 1000.0f : 0;
-    last_ms_ = now_ms;
-    if (have_x_) p_ += PROCESS_NOISE * dt;
+    trk_.predict(now_ms);
 
     if (!used) {
         r.state = NO_SIGNAL;
-        if (++bad_streak_ > 8) reset();
-        r.bpm = have_x_ ? x_ : 0;
+        trk_.no_signal();
+        r.bpm = trk_.x();
         return r;
     }
     for (int k = 0; k < NB_EXT; k++) fused[k] /= wsum;
@@ -333,7 +328,7 @@ Result Estimator::update(const Sample *samples, int n, uint32_t now_ms)
 
     // peak search: harmonic reinforcement + soft prior around tracked rate
     float F[NB];
-    const bool tracking = have_x_ && good_streak_ >= 2;
+    const bool tracking = trk_.tracking();
     for (int k = 0; k < NB; k++) {
         const int k2 = 2 * k + int(BPM_MIN / BPM_STEP);
         // A pulse's 2nd harmonic is weaker than its fundamental. If the power at
@@ -342,7 +337,7 @@ Result Estimator::update(const Sample *samples, int n, uint32_t now_ms)
         const float h2 = k2 < NB_EXT ? fused[k2] : 0;
         F[k] = h2 <= fused[k] ? fused[k] + 0.5f * h2 : 0.5f * fused[k];
         if (tracking) {
-            const float d = (bin_bpm(k) - x_) / 15.0f;
+            const float d = (bin_bpm(k) - trk_.x()) / 15.0f;
             F[k] *= 0.3f + 0.7f * std::exp(-0.5f * d * d);
         }
     }
@@ -352,12 +347,7 @@ Result Estimator::update(const Sample *samples, int n, uint32_t now_ms)
     r.snr_db = snr_at(fused, kb);
     // quality = SNR score x peak stability: a real pulse stays put from
     // window to window, noise peaks wander
-    hist_[hist_i_] = z;
-    hist_i_ = (hist_i_ + 1) % kHist;
-    if (hist_n_ < kHist) hist_n_++;
-    int agree = 0;
-    for (int i = 0; i < hist_n_; i++) agree += std::fabs(hist_[i] - z) <= 4;
-    r.stability = hist_n_ >= 3 ? float(agree) / hist_n_ : 0.5f;
+    r.stability = trk_.stability(z);
     const float q_snr = 1.0f / (1.0f + std::exp(-(r.snr_db - SNR_MID) / 1.0f));
     // cross-ROI coherence: a real pulse beats in phase over forehead and
     // cheeks, while sensor noise in each region is independent
@@ -379,39 +369,11 @@ Result Estimator::update(const Sample *samples, int n, uint32_t now_ms)
     const float q_coh = pairs ? std::fmin(1.0f, std::fmax(0.0f, (r.coherence - 0.05f) / 0.25f)) : 0.5f;
     // hysteresis: coherence is required to acquire a lock, not to keep one
     const float q_keep = q_snr * (0.25f + 0.75f * r.stability);
-    r.quality = good_streak_ >= 4 ? std::fmax(q_keep, q_keep * q_coh) : q_keep * q_coh;
+    r.quality = trk_.good_streak() >= 4 ? std::fmax(q_keep, q_keep * q_coh) : q_keep * q_coh;
 
-    // Kalman update with gating
-    bool accepted = false;
-    if (r.motion < MOTION_MAX && r.quality >= 0.2f) {
-        const float R = 4 + 250 * (1 - r.quality) * (1 - r.quality);
-        if (!have_x_) {
-            x_ = z; p_ = R; have_x_ = true; accepted = true;
-        } else {
-            const float innov = z - x_;
-            const float gate = std::fmax(12.0f, 3 * std::sqrt(p_ + R));
-            if (std::fabs(innov) <= gate) {
-                const float K = p_ / (p_ + R);
-                x_ += K * innov;
-                p_ *= (1 - K);
-                accepted = true;
-                outlier_streak_ = 0;
-            } else if (++outlier_streak_ >= 4) {  // persistent disagreement: re-acquire
-                x_ = z; p_ = R; outlier_streak_ = 0; good_streak_ = 0; accepted = true;
-            }
-        }
-    }
-    if (accepted && r.quality >= 0.5f) {
-        good_streak_++;
-        bad_streak_ = 0;
-    } else if (!accepted) {
-        bad_streak_++;
-        if (good_streak_ > 0 && bad_streak_ > 3) good_streak_--;
-    }
-    if (bad_streak_ > 10) reset();
-
-    r.state = (have_x_ && good_streak_ >= 4) ? LOCKED : ACQUIRING;
-    r.bpm = have_x_ ? x_ : 0;
+    trk_.update(z, r.quality, r.motion < MOTION_MAX);
+    r.state = trk_.locked() ? LOCKED : ACQUIRING;
+    r.bpm = trk_.x();
     return r;
 }
 

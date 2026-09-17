@@ -12,3 +12,5 @@ data/*
 !data/SOURCES.md
 recordings/
 snapshot_*.png
+idf/test/test_resp
+idf/test/resp_replay

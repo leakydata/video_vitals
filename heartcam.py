@@ -7,9 +7,15 @@ The heart rate is computed on the ESP32. This viewer shows:
   * the pulse waveform, computed here with POS from the device's own
     uncompressed per-frame ROI samples (for display only)
   * the device's heart rate, quality, and lock state
+  * the device's breathing rate, the image tile it is measured on, and the
+    breathing waveform (that tile's displacement)
 
 Keys: q quit | m magnification | a re-auto-expose | r rotate 180
-      +/- exposure | M toggle mono(IR) mode | s snapshot
+      +/- exposure | M toggle mono(IR) mode | b adult/infant breathing band
+      p breathing pacer on/off, [ ] pacer rate | s snapshot
+
+The pacer is a reference for testing: breathe in while the circle grows and
+out while it shrinks, and compare the device's rate with the pacer's.
 """
 import argparse
 import re
@@ -21,9 +27,21 @@ from collections import deque
 import cv2
 import numpy as np
 import serial
+import serial.tools.list_ports
 from scipy.signal import butter, sosfiltfilt
 
 FS = 20.0
+
+
+ESPRESSIF_VID = 0x303A
+
+
+def find_port():
+    """First Espressif USB serial device (the port name changes across replugs)."""
+    for p in serial.tools.list_ports.comports():
+        if p.vid == ESPRESSIF_VID:
+            return p.device
+    return None
 
 
 class Device(threading.Thread):
@@ -31,21 +49,66 @@ class Device(threading.Thread):
 
     def __init__(self, port, record=None):
         super().__init__(daemon=True)
-        self.ser = serial.Serial(port, 115200, timeout=0.05)
+        self.port = port
+        self.ser = None
+        self.startup = []  # commands re-sent after every (re)connect
+        self.connected = False
         self.frames = deque(maxlen=4)
         self.samples = deque(maxlen=600)  # (t, [[r,g,b,n] x3], motion)
         self.hr = {}
         self.hr_time = 0
+        self.rr = {}
+        self.motion = deque(maxlen=600)  # (t, displacements[32], valid mask, gross)
         self.running = True
         self.rec = open(record, "wb") if record else None
 
-    def send(self, cmd):
-        self.ser.write((cmd + "\n").encode())
+    def mark(self, text):
+        """Write an annotation line into the recording."""
+        if self.rec:
+            self.rec.write(("\n# viewer " + text + "\n").encode())
+
+    def send(self, cmd, startup=False):
+        if startup:
+            self.startup.append(cmd)
+        try:
+            if self.ser:
+                self.ser.write((cmd + "\n").encode())
+        except (serial.SerialException, OSError):
+            pass
+
+    def _connect(self):
+        """Open the port, retrying until it appears (board unplugged or rebooting)."""
+        while self.running:
+            port = find_port() if self.port == "auto" else self.port
+            try:
+                if not port:
+                    raise serial.SerialException("no Espressif device")
+                self.ser = serial.Serial(port, 115200, timeout=0.05)
+                time.sleep(0.2)
+                for c in self.startup:
+                    self.ser.write((c + "\n").encode())
+                if not self.connected:
+                    print("[viewer] connected to", port)
+                self.connected = True
+                return True
+            except (serial.SerialException, OSError):
+                self.connected = False
+                time.sleep(1.0)
+        return False
 
     def _line(self, line):
         if line.startswith("HR "):
             self.hr = dict(re.findall(r"(\w+)=([\w.\-]+)", line))
             self.hr_time = time.time()
+        elif line.startswith("RR "):
+            self.rr = dict(re.findall(r"(\w+)=([\w.\-]+)", line))
+        elif line.startswith("M "):
+            v = line.split()
+            if len(v) == 37:
+                try:
+                    self.motion.append((int(v[1]) / 1000.0, np.array(v[5:], float), int(v[2]), int(v[4])))
+                except ValueError:
+                    pass
         elif line.startswith("S "):
             v = line.split()
             if len(v) == 15:
@@ -63,11 +126,23 @@ class Device(threading.Thread):
 
     def run(self):
         buf = b""
+        if not self._connect():
+            return
         while self.running:
             try:
                 chunk = self.ser.read(65536)
-            except serial.SerialException:
-                break
+            except (serial.SerialException, OSError):
+                print("[viewer] board disconnected, waiting for it to come back...")
+                self.connected = False
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
+                self.ser = None
+                buf = b""
+                if not self._connect():
+                    break
+                continue
             if self.rec and chunk:
                 self.rec.write(chunk)
             buf += chunk
@@ -105,7 +180,8 @@ class Device(threading.Thread):
             self.send("x")
             self.send("w")
         finally:
-            self.ser.close()
+            if self.ser:
+                self.ser.close()
             if self.rec:
                 self.rec.close()
 
@@ -158,6 +234,34 @@ class Magnifier:
         return (np.clip(frame.astype(np.float32) / 255 + up, 0, 1) * 255).astype(np.uint8)
 
 
+def breathing_wave(motion, ch, seconds=30.0):
+    """Band-passed displacement of the device's best breathing channel."""
+    if ch < 0 or len(motion) < 30:
+        return None
+    ts = np.array([m[0] for m in motion])
+    keep = ts > ts[-1] - seconds
+    ts = ts[keep]
+    d = np.array([m[1][ch] for m in motion])[keep]
+    if len(ts) < 30 or ts[-1] - ts[0] < 10:
+        return None
+    tu = np.arange(ts[0], ts[-1], 0.2)
+    x = np.interp(tu, ts, d)
+    x = x - np.polyval(np.polyfit(tu, x, 1), tu)
+    sos = butter(2, [0.1, 0.75], btype="band", fs=5, output="sos")
+    return sosfiltfilt(sos, x)
+
+
+def draw_tile(img, ch, color):
+    if ch < 0:
+        return
+    t = ch // 2
+    tx, ty = t % 4, t // 4
+    x0, y0 = tx * img.shape[1] // 4, ty * img.shape[0] // 4
+    cv2.rectangle(img, (x0, y0), (x0 + img.shape[1] // 4 - 1, y0 + img.shape[0] // 4 - 1), color, 1)
+    arrow = "|" if ch % 2 == 0 else "-"
+    cv2.putText(img, "breath " + arrow, (x0 + 3, y0 + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
+
+
 def draw_overlay(img, meta):
     if meta[0] >= 0:
         cv2.rectangle(img, meta[0:2], meta[2:4], (255, 160, 0), 1)
@@ -187,7 +291,7 @@ def fmt_status(hr):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--port", default="/dev/ttyACM0")
+    ap.add_argument("--port", default="auto", help="serial port (default: find the ESP32 by USB id)")
     ap.add_argument("--scale", type=float, default=2.0, help="display scale")
     ap.add_argument("--alpha", type=float, default=60.0, help="magnification factor")
     ap.add_argument("--headless", action="store_true", help="no window; print the device heart rate")
@@ -197,16 +301,17 @@ def main():
     args = ap.parse_args()
 
     dev = Device(args.port, args.record)
-    dev.start()
-    dev.send("v")
+    dev.send("v", startup=True)
     if not args.no_video and not args.headless:
-        dev.send("s")
+        dev.send("s", startup=True)
+    dev.start()
     mag = Magnifier(alpha=args.alpha)
     magnify = True
     exposure = 300
     last_t = None
     last_print = 0
     view = None
+    pacer_on, pacer_rate, pacer_t0 = False, 10.0, time.time()
     start = time.time()
     try:
         while not args.seconds or time.time() - start < args.seconds:
@@ -215,10 +320,14 @@ def main():
                 if dev.hr_time > last_print:
                     last_print = dev.hr_time
                     h = dev.hr
+                    rr = dev.rr
                     print(f"bpm={h.get('bpm')} raw={h.get('raw')} {fmt_status(h)} face={h.get('face')} "
-                          f"det_hit={h.get('det_hit')} fps={h.get('fps')}", flush=True)
+                          f"det_hit={h.get('det_hit')} fps={h.get('fps')} | breathing={rr.get('br')}/min "
+                          f"{rr.get('state')} q={rr.get('q')} snr={rr.get('snr')}", flush=True)
                 continue
 
+            if not dev.connected:
+                view = None
             if dev.frames:
                 t, meta, jpg = dev.frames.popleft()
                 frame = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
@@ -227,17 +336,33 @@ def main():
                     last_t = t
                     left = frame.copy()
                     draw_overlay(left, meta)
+                    draw_tile(left, int(dev.rr.get("best", -1)), (255, 255, 0))
                     right = mag(frame, dt) if magnify else frame
                     view = cv2.resize(np.hstack([left, right]), None, fx=args.scale, fy=args.scale)
             if view is None:
                 view = np.zeros((int(240 * args.scale), int(640 * args.scale), 3), np.uint8)
-                cv2.putText(view, "waiting for video..." if not args.no_video else "video off",
+                msg = "video off" if args.no_video else "waiting for video..."
+                if not dev.connected:
+                    msg = "board disconnected - waiting for it..."
+                cv2.putText(view, msg,
                             (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
 
             W = view.shape[1]
-            panel = np.zeros((190, W, 3), np.uint8)
+            panel = np.zeros((330, W, 3), np.uint8)
             pulse = pos_pulse(list(dev.samples))
             draw_plot(panel, 5, 5, W - 10, 95, pulse, (90, 90, 255), "pulse (POS on device samples, last 10 s)")
+            rr = dev.rr
+            breath = breathing_wave(list(dev.motion), int(rr.get("best", -1)))
+            draw_plot(panel, 5, 195, W - 10, 80, breath, (255, 255, 0), "breathing (best tile displacement, last 30 s)")
+            rstate = rr.get("state", "")
+            rcol = {"locked": (255, 255, 80), "acquiring": (0, 200, 255)}.get(rstate, (120, 120, 120))
+            br = float(rr.get("br", 0) or 0)
+            cv2.putText(panel, f"{br:4.1f} /min" if br > 0 else "--.- /min", (10, 318),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, rcol, 3)
+            cv2.putText(panel, f"breathing {rstate}  q={rr.get('q', '?')} snr={rr.get('snr', '?')}dB "
+                               f"stab={rr.get('stab', '?')} agree={rr.get('agree', '?')} motion={rr.get('motion', '?')} "
+                               f"band={rr.get('band', '?')}",
+                        (300, 312), cv2.FONT_HERSHEY_SIMPLEX, 0.5, rcol, 1)
             h = dev.hr
             state = h.get("state", "")
             bpm = float(h.get("bpm", 0) or 0)
@@ -255,6 +380,16 @@ def main():
                 q = 0
             cv2.rectangle(panel, (300, 162), (300 + int(300 * q), 176), col, -1)
             cv2.rectangle(panel, (300, 162), (600, 176), (90, 90, 90), 1)
+            if pacer_on:
+                phase = ((time.time() - pacer_t0) * pacer_rate / 60.0) % 1.0
+                size = 0.5 - 0.5 * np.cos(2 * np.pi * phase)  # grows (inhale) then shrinks (exhale)
+                cx, cy = W - 110, 90
+                cv2.circle(view, (cx, cy), int(20 + 60 * size), (255, 200, 80), 3)
+                label = "breathe IN" if phase < 0.5 else "breathe OUT"
+                cv2.putText(view, f"{label}  pacer {pacer_rate:.0f}/min", (cx - 105, cy + 105),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 80), 2)
+                cv2.putText(panel, f"pacer {pacer_rate:.0f}/min", (W - 220, 318), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                            (255, 200, 80), 2)
             if state == "locked" and pulse is not None and pulse[-1] > 0:
                 cv2.circle(panel, (W - 30, 140), 14, (60, 60, 255), -1)
             cv2.imshow("heart_cam", np.vstack([view, panel]))
@@ -268,6 +403,16 @@ def main():
                 dev.send("a")
             elif key == ord("r"):
                 dev.send("r")
+            elif key == ord("p"):
+                pacer_on = not pacer_on
+                pacer_t0 = time.time()
+                dev.mark(f"pacer {'on' if pacer_on else 'off'} rate={pacer_rate:.0f} t={time.time():.3f}")
+            elif key in (ord("["), ord("]")):
+                pacer_rate = float(np.clip(pacer_rate + (1 if key == ord("]") else -1), 4, 40))
+                pacer_t0 = time.time()
+                dev.mark(f"pacer {'on' if pacer_on else 'off'} rate={pacer_rate:.0f} t={time.time():.3f}")
+            elif key == ord("b"):
+                dev.send("b1" if dev.rr.get("band") != "infant" else "b0")
             elif key == ord("M"):
                 dev.send("m1" if h.get("mode") != "mono" else "m0")
             elif key in (ord("+"), ord("="), ord("-")):

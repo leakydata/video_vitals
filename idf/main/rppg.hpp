@@ -12,6 +12,8 @@
 #pragma once
 #include <cstdint>
 
+#include "tracker.hpp"
+
 namespace rppg {
 
 constexpr int kRois = 3;          // forehead, left cheek, right cheek
@@ -27,7 +29,6 @@ constexpr int NB = 281;           // bins between BPM_MIN and BPM_MAX
 constexpr int NB_EXT = 641;       // bins up to 2*BPM_MAX (for harmonics)
 
 enum class Mode : uint8_t { RGB, MONO };
-enum State : uint8_t { NO_SIGNAL = 0, ACQUIRING = 1, LOCKED = 2 };
 
 struct RoiSample {
     float r, g, b;
@@ -91,14 +92,7 @@ private:
     float P_[kRois][NB_EXT];
     float pulse_[N];
 
-    // tracker
-    bool have_x_ = false;
-    float x_ = 0, p_ = 0;
-    uint32_t last_ms_ = 0;
-    int good_streak_ = 0, bad_streak_ = 0, outlier_streak_ = 0;
-    static constexpr int kHist = 6;
-    float hist_[kHist];
-    int hist_n_ = 0, hist_i_ = 0;
+    Tracker trk_;
 };
 
 } // namespace rppg

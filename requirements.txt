@@ -2,3 +2,4 @@ opencv-python<5
 numpy
 scipy
 pyserial
+h5py

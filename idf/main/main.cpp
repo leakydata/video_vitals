@@ -3,12 +3,13 @@
 // Tasks
 //   cam     (core 1)  RGB565 QVGA capture, per-ROI skin colour means
 //   detect  (core 0)  ESP-DL ESPDet-Pico + MNP landmarks, smoothing, motion flag
-//   hr      (core 1)  rPPG estimator (rppg.cpp) once per second
+//   hr      (core 1)  rPPG (rppg.cpp) and breathing (resp.cpp) estimators once per second
 //   stream  (core 0)  optional JPEG preview with face/ROI metadata
 //   cmd, led
 //
 // Serial protocol (USB Serial/JTAG)
-//   device -> host  text lines: "HR key=value ...", "S t r g b n ... motion",
+//   device -> host  text lines: "HR ...", "RR ..." (breathing), "S t r g b n ... motion",
+//                   "M t valid jump gross d0..d31" (tile displacements),
 //                   "# log"; binary frames:
 //                   'H','C','F','2' | u32 len | u32 t_ms | i16 meta[26] | jpeg
 //                   meta = face box x1,y1,x2,y2 | 5 landmarks (x,y) | 3 ROIs x,y,w,h
@@ -17,6 +18,7 @@
 //     s/x stream on/off     v/w per-frame samples on/off
 //     a   auto-expose 2 s then lock          e<n> exposure   g<n> gain
 //     q<n> JPEG quality (1-100)              m0/m1 RGB / mono(IR) mode
+//     b0/b1 breathing band adult (6-45/min) / infant (6-78/min)
 //     r   rotate image 180 degrees (also automatic when a face is upside down)
 //     i   info
 #include <algorithm>
@@ -38,6 +40,8 @@
 
 #include "dl_image_jpeg.hpp"
 #include "human_face_detect.hpp"
+#include "motion.hpp"
+#include "resp.hpp"
 #include "rppg.hpp"
 
 static const char *TAG = "heart_cam";
@@ -49,7 +53,9 @@ static constexpr int CAM_VSYNC = 38, CAM_HREF = 47, CAM_PCLK = 13;
 static constexpr gpio_num_t LED_PIN = GPIO_NUM_21;  // active low
 
 static constexpr int W = 320, H = 240;
-static constexpr float JUMP_MOTION = 0.04f;  // relative frame-to-frame ROI brightness change flagged as motion
+static constexpr float JUMP_MOTION = 0.04f;
+static constexpr uint16_t MIN_ROI_PIXELS = 40;
+static constexpr float FACE_MOTION = 0.35f;  // face-widths per second counted as movement  // relative frame-to-frame ROI brightness change flagged as motion
 static constexpr int64_t FACE_HOLD_US = 2500000;  // keep using the last face this long after a miss
 
 // ---------------------------------------------------------------- output
@@ -113,9 +119,12 @@ static SemaphoreHandle_t face_mtx, buf_mtx;
 static Face g_face;
 static rppg::Buffer *g_buf;
 static rppg::Estimator *g_est;
+static resp::Buffer *g_rbuf;
+static resp::Estimator *g_rest;
+static resp::TileMotion *g_tiles;
 
 static struct {
-    bool stream = false, samples = false, mono = false;
+    bool stream = false, samples = false, mono = false, infant = false;
     int quality = 80;
     volatile bool relock = false;
     volatile bool flip_request = false;  // rotate the sensor image 180 degrees
@@ -125,6 +134,7 @@ static struct {
 static struct {
     float cam_fps = 0, det_fps = 0, det_ms = 0, det_hit = 0;
     rppg::Result res{};
+    resp::Result rr{};
 } stats;
 
 // detector / stream frame handoff
@@ -313,7 +323,9 @@ static void cam_task(void *)
             }
             xSemaphoreTake(buf_mtx, portMAX_DELAY);
             g_buf->clear();
+            g_rbuf->clear();
             xSemaphoreGive(buf_mtx);
+            g_tiles->reset();
         }
         camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) continue;
@@ -362,9 +374,12 @@ static void cam_task(void *)
                 m.b *= gain[i][2];
                 // a large frame-to-frame brightness jump means the subject or
                 // camera moved (the pulse changes brightness by well under 1%)
+                if (m.n < MIN_ROI_PIXELS) m = {0, 0, 0, 0};  // too few pixels: mostly noise
                 if (m.n && prev[i].n) {
+                    // the noise of an ROI mean grows as 1/sqrt(pixels): scale the threshold
                     const float y0 = prev[i].r + prev[i].g + prev[i].b, y1 = m.r + m.g + m.b;
-                    if (y0 > 0 && std::fabs(y1 - y0) / y0 > JUMP_MOTION) jump_until = now + 300000;
+                    const float thr = JUMP_MOTION * std::max(1.0f, std::sqrt(200.0f / std::min(m.n, prev[i].n)));
+                    if (y0 > 0 && std::fabs(y1 - y0) / y0 > thr) jump_until = now + 300000;
                 }
                 prev[i] = m;
                 s.roi[i] = m;
@@ -375,14 +390,27 @@ static void cam_task(void *)
             for (auto &p : prev) p.n = 0;
         }
 
+        resp::MotionSample ms;
+        g_tiles->process_rgb565be(fb->buf, W, H, t_ms, now < f.motion_until_us, ms);
+
         xSemaphoreTake(buf_mtx, portMAX_DELAY);
         g_buf->push(s);
+        g_rbuf->push(ms);
         xSemaphoreGive(buf_mtx);
 
         if (cfg.samples) {
             out_printf("S %lu %.2f %.2f %.2f %u %.2f %.2f %.2f %u %.2f %.2f %.2f %u %d\n", (unsigned long)t_ms,
                        s.roi[0].r, s.roi[0].g, s.roi[0].b, s.roi[0].n, s.roi[1].r, s.roi[1].g, s.roi[1].b,
                        s.roi[1].n, s.roi[2].r, s.roi[2].g, s.roi[2].b, s.roi[2].n, s.motion);
+            char line[400];
+            int len = snprintf(line, sizeof(line), "M %lu %lu %lu %d", (unsigned long)t_ms, (unsigned long)ms.valid,
+                               (unsigned long)ms.jump, ms.gross);
+            for (int c = 0; c < resp::kChan && len < (int)sizeof(line) - 12; c++)
+                len += snprintf(line + len, sizeof(line) - len, " %.3f", ms.d[c]);
+            line[len++] = '\n';
+            xSemaphoreTake(out_mtx, portMAX_DELAY);
+            out_raw(line, len);
+            xSemaphoreGive(out_mtx);
         }
 
         if (!det_busy) {
@@ -502,13 +530,19 @@ static void detect_task(void *)
             const float bw = box[2] - box[0];
             const float c[2] = {(box[0] + box[2]) / 2, (box[1] + box[3]) / 2};
 
-            // motion: face centre speed in face-widths per second
-            if (prev_t && now - prev_t < 500000) {
-                const float v = std::hypot(c[0] - prev_c[0], c[1] - prev_c[1]) / bw / ((now - prev_t) / 1e6f);
-                if (v > 0.25f) g_face.motion_until_us = now + 400000;
+            // motion: speed of the (lightly smoothed) face centre in face-widths per
+            // second. The raw detector box jitters by a few pixels, so the
+            // threshold sits well above that.
+            if (prev_t && now - prev_t < 800000) {
+                const float sc[2] = {0.5f * c[0] + 0.5f * prev_c[0], 0.5f * c[1] + 0.5f * prev_c[1]};
+                const float v = std::hypot(sc[0] - prev_c[0], sc[1] - prev_c[1]) / bw / ((now - prev_t) / 1e6f);
+                if (v > FACE_MOTION) g_face.motion_until_us = now + 400000;
+                prev_c[0] = sc[0];
+                prev_c[1] = sc[1];
+            } else {
+                prev_c[0] = c[0];
+                prev_c[1] = c[1];
             }
-            prev_c[0] = c[0];
-            prev_c[1] = c[1];
             prev_t = now;
 
             const bool fresh = !g_face.valid || now - g_face.t_us > FACE_HOLD_US ||
@@ -552,11 +586,13 @@ static const char *state_name(rppg::State s)
 static void hr_task(void *)
 {
     auto *tmp = (rppg::Sample *)heap_caps_malloc(sizeof(rppg::Sample) * rppg::kCap, MALLOC_CAP_SPIRAM);
+    auto *rtmp = (resp::MotionSample *)heap_caps_malloc(sizeof(resp::MotionSample) * resp::kCap, MALLOC_CAP_SPIRAM);
     TickType_t last = xTaskGetTickCount();
     for (;;) {
         xTaskDelayUntil(&last, pdMS_TO_TICKS(1000));
         xSemaphoreTake(buf_mtx, portMAX_DELAY);
         const int n = g_buf->copy(tmp);
+        const int rn = g_rbuf->copy(rtmp);
         xSemaphoreGive(buf_mtx);
         g_est->set_mode(cfg.mono ? rppg::Mode::MONO : rppg::Mode::RGB);
         const int64_t t0 = esp_timer_get_time();
@@ -572,6 +608,16 @@ static void hr_task(void *)
                    r.bpm, r.bpm_raw, r.snr_db, r.quality, r.stability, r.coherence, state_name(r.state),
                    r.motion, r.rois_used, face, stats.det_hit, stats.cam_fps, stats.det_fps, stats.det_ms, ms,
                    cfg.mono ? "mono" : "rgb");
+
+        g_rest->set_band(cfg.infant ? resp::Band::INFANT : resp::Band::ADULT);
+        const int64_t t1 = esp_timer_get_time();
+        const resp::Result rr = rn ? g_rest->update(rtmp, rn, rtmp[rn - 1].t_ms) : resp::Result{};
+        const float rms = (esp_timer_get_time() - t1) / 1000.0f;
+        stats.rr = rr;
+        out_printf("RR br=%.1f raw=%.1f snr=%.1f q=%.2f stab=%.2f agree=%.2f state=%s motion=%.2f ch=%d best=%d "
+                   "band=%s est_ms=%.0f\n",
+                   rr.brpm, rr.raw, rr.snr_db, rr.quality, rr.stability, rr.agreement, state_name(rr.state), rr.motion,
+                   rr.channels, rr.best, cfg.infant ? "infant" : "adult", rms);
     }
 }
 
@@ -644,6 +690,10 @@ static void handle_command(char *line)
         cfg.mono = v != 0;
         out_printf("# mode %s\n", cfg.mono ? "mono" : "rgb");
         break;
+    case 'b':
+        cfg.infant = v != 0;
+        out_printf("# breathing band %s\n", cfg.infant ? "infant (6-78/min)" : "adult (6-45/min)");
+        break;
     case 'i':
         out_printf("# heart_cam idf PID=0x%04x stream=%d samples=%d mode=%s cam_fps=%.1f det_fps=%.1f "
                    "psram_free=%u int_free=%u\n",
@@ -691,6 +741,9 @@ extern "C" void app_main(void)
 
     g_buf = new rppg::Buffer();
     g_est = new rppg::Estimator();
+    g_rbuf = new resp::Buffer();
+    g_rest = new resp::Estimator();
+    g_tiles = new resp::TileMotion();
     det_frame = (uint8_t *)heap_caps_malloc(W * H * 2, MALLOC_CAP_SPIRAM);
     str_frame = (uint8_t *)heap_caps_malloc(W * H * 2, MALLOC_CAP_SPIRAM);
 
@@ -705,7 +758,7 @@ extern "C" void app_main(void)
 
     xTaskCreatePinnedToCore(cam_task, "cam", 6144, nullptr, 6, nullptr, 1);
     xTaskCreatePinnedToCore(detect_task, "detect", 16384, nullptr, 4, nullptr, 0);
-    xTaskCreatePinnedToCore(hr_task, "hr", 16384, nullptr, 5, nullptr, 1);
+    xTaskCreatePinnedToCore(hr_task, "hr", 24576, nullptr, 5, nullptr, 1);
     xTaskCreatePinnedToCore(stream_task, "stream", 8192, nullptr, 3, nullptr, 0);
     xTaskCreatePinnedToCore(led_task, "led", 2048, nullptr, 2, nullptr, 1);
     xTaskCreatePinnedToCore(cmd_task, "cmd", 4096, nullptr, 5, nullptr, 0);

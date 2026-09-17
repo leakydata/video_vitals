@@ -1,0 +1,191 @@
+// Host test for breathing detection: renders synthetic 320x240 RGB565 frames
+// (textured scene with a "person" whose chest moves sub-pixel), runs them
+// through TileMotion + resp::Estimator exactly as the firmware does.
+// Build: g++ -O2 -std=c++17 -I../main test_resp.cpp ../main/motion.cpp ../main/resp.cpp -o test_resp
+#include "motion.hpp"
+#include "resp.hpp"
+
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <random>
+#include <string>
+#include <vector>
+
+using namespace resp;
+
+static constexpr int W = 320, H = 240;
+
+struct Scene {
+    std::vector<float> bg, person;  // luminance textures, larger than the frame for shifting
+    int pad = 16;
+    void build(unsigned seed)
+    {
+        std::mt19937 rng(seed);
+        std::uniform_real_distribution<float> u(0, 1);
+        const int w = W + 2 * pad, h = H + 2 * pad;
+        auto make = [&](std::vector<float> &img, int blobs, float lo, float hi) {
+            img.assign(w * h, 0);
+            for (int b = 0; b < blobs; b++) {
+                const float cx = u(rng) * w, cy = u(rng) * h, r = 3 + u(rng) * 14, a = (u(rng) - 0.5f) * 80;
+                for (int y = std::max(0, int(cy - 3 * r)); y < std::min(h, int(cy + 3 * r)); y++)
+                    for (int x = std::max(0, int(cx - 3 * r)); x < std::min(w, int(cx + 3 * r)); x++) {
+                        const float d2 = ((x - cx) * (x - cx) + (y - cy) * (y - cy)) / (r * r);
+                        img[y * w + x] += a * std::exp(-0.5f * d2);
+                    }
+            }
+            for (auto &v : img) v = std::clamp(lo + (hi - lo) * 0.5f + v, 10.0f, 245.0f);
+        };
+        make(bg, 400, 60, 140);
+        make(person, 300, 90, 170);  // clothing / skin texture
+    }
+    float sample(const std::vector<float> &img, float x, float y) const
+    {
+        const int w = W + 2 * pad;
+        x += pad;
+        y += pad;
+        const int x0 = int(x), y0 = int(y);
+        const float fx = x - x0, fy = y - y0;
+        const float a = img[y0 * w + x0], b = img[y0 * w + x0 + 1];
+        const float c = img[(y0 + 1) * w + x0], d = img[(y0 + 1) * w + x0 + 1];
+        return (a + fx * (b - a)) * (1 - fy) + (c + fx * (d - c)) * fy;
+    }
+};
+
+struct Scenario {
+    const char *name;
+    float seconds;
+    std::function<float(float)> rate;  // breaths/min vs time (0 = not breathing)
+    float amp = 0.5f;                  // chest displacement amplitude (px)
+    Band band = Band::ADULT;
+    float noise = 2.0f;                // pixel noise (levels)
+    float flicker = 0.0f;              // relative global brightness modulation
+    float flicker_hz = 0.3f;
+    float bcg = 0.05f;                 // heartbeat micro-motion (px) at 1.2 Hz
+    std::function<bool(float)> gross = [](float) { return false; };
+    float tol = 1.5f;
+    enum { LOCK, NEVER } expect = LOCK;
+    bool local_motion = false;         // hand-like random movement in the lower-left tile
+};
+
+static int run(const Scenario &sc, unsigned seed)
+{
+    static Scene scene;
+    scene.build(seed * 7 + 1);
+    static TileMotion tm;
+    static Buffer buf;
+    static Estimator est;
+    static MotionSample tmp[kCap];
+    tm.reset();
+    buf.clear();
+    est.set_band(sc.band);
+    est.reset();
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> g(0, 1);
+    std::uniform_real_distribution<float> u(-1, 1);
+    std::vector<uint8_t> frame(W * H * 2);
+
+    float t = 0, phase = 0, jump_x = 0, jump_y = 0, next = 1;
+    int checks = 0, fails = 0, locked = 0;
+    float err = 0;
+    while (t < sc.seconds) {
+        const float dt = 0.09f + 0.01f * u(rng);
+        t += dt;
+        const float br = sc.rate(t);
+        if (br > 0) phase += 2 * M_PI * br / 60 * dt;
+        // breathing waveform: faster inhale than exhale
+        const float s = br > 0 ? sc.amp * (std::sin(phase) + 0.25f * std::sin(2 * phase)) : 0;
+        const float beat = sc.bcg * std::sin(2 * M_PI * 1.2f * t);
+        const bool gross = sc.gross(t);
+        if (gross) { jump_x += 1.5f * g(rng); jump_y += 1.5f * g(rng); }
+        jump_x = std::clamp(jump_x, -10.0f, 10.0f);
+        jump_y = std::clamp(jump_y, -10.0f, 10.0f);
+        const float light = 1 + sc.flicker * std::sin(2 * M_PI * sc.flicker_hz * t);
+        static float hand_x = 0, hand_y = 0;
+        if (sc.local_motion) { hand_x = 6 * std::sin(1.7f * t) + 2 * g(rng); hand_y = 5 * std::cos(2.3f * t) + 2 * g(rng); }
+
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) {
+                float v;
+                const bool chest = x >= 70 && x < 250 && y >= 130;
+                const bool head = x >= 120 && x < 200 && y >= 30 && y < 130;
+                const bool hand = sc.local_motion && x < 60 && y >= 180;
+                if (hand) v = scene.sample(scene.person, std::clamp(x - hand_x, 0.0f, W - 2.0f), std::clamp(y - hand_y, 0.0f, H - 2.0f));
+                else if (chest) v = scene.sample(scene.person, x - jump_x, y - s - beat - jump_y);
+                else if (head) v = scene.sample(scene.person, x - jump_x, y - 0.3f * s - beat - jump_y);
+                else v = scene.sample(scene.bg, x, y);
+                v = std::clamp(v * light + sc.noise * g(rng), 0.0f, 255.0f);
+                const int R = int(v) >> 3, G = int(v) >> 2, B = int(v) >> 3;
+                const uint16_t p = (R << 11) | (G << 5) | B;
+                frame[(y * W + x) * 2] = p >> 8;
+                frame[(y * W + x) * 2 + 1] = p & 0xff;
+            }
+        MotionSample ms;
+        tm.process_rgb565be(frame.data(), W, H, uint32_t(t * 1000), false, ms);
+        buf.push(ms);
+
+        if (t >= next) {
+            next += 1;
+            const int n = buf.copy(tmp);
+            const Result r = est.update(tmp, n, ms.t_ms);
+            if (getenv("DBG"))
+                std::printf("    t=%5.1f true=%5.1f br=%5.1f raw=%5.1f snr=%5.1f q=%.2f stab=%.2f agr=%.2f st=%d ch=%d best=%d mot=%.2f\n",
+                            t, br, r.brpm, r.raw, r.snr_db, r.quality, r.stability, r.agreement, r.state,
+                            r.channels, r.best, r.motion);
+            if (r.state == rppg::LOCKED) locked++;
+            if (t > sc.seconds - 15) {
+                checks++;
+                const bool lk = r.state == rppg::LOCKED;
+                const float e = std::fabs(r.brpm - br);
+                err += e;
+                if (sc.expect == Scenario::LOCK && (!lk || e > sc.tol)) fails++;
+                if (sc.expect == Scenario::NEVER && lk) fails++;
+            }
+        }
+    }
+    const bool ok = fails <= checks / 5;
+    std::printf("  %-36s seed=%u  mean_err_last15s=%5.2f  locked=%3ds  %s\n", sc.name, seed, err / checks, locked,
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+int main(int argc, char **argv)
+{
+    auto hr = [](float v) { return [v](float) { return v; }; };
+    std::vector<Scenario> sc = {
+        {"adult 15/min, 0.5 px", 75, hr(15)},
+        {"slow 8/min, 0.8 px", 75, hr(8), 0.8f},
+        {"fast 30/min, 0.4 px", 75, hr(30), 0.4f},
+        {"shallow 12/min, 0.15 px", 75, hr(12), 0.15f},
+        {"infant 45/min (infant band)", 75, hr(45), 0.3f, Band::INFANT},
+        {"change 12->20/min at 40-50 s", 90, [](float t) { return t < 40 ? 12 : (t > 50 ? 20.0f : 12 + 0.8f * (t - 40)); },
+         0.5f, Band::ADULT, 2.0f, 0, 0.3f, 0.05f, [](float) { return false; }, 2.5f},
+        {"gross motion 2 s every 20 s, 16/min", 90, hr(16), 0.5f, Band::ADULT, 2.0f, 0, 0.3f, 0.05f,
+         [](float t) { return std::fmod(t, 20.0f) < 2; }},
+        {"light flicker 3% + 14/min", 75, hr(14), 0.5f, Band::ADULT, 2.0f, 0.03f},
+        {"hand moving in a corner, 13/min", 75, hr(13), 0.5f, Band::ADULT, 2.0f, 0, 0.3f, 0.05f,
+         [](float) { return false; }, 1.5f, Scenario::LOCK, true},
+        {"no breathing (must not lock)", 75, hr(0), 0.5f, Band::ADULT, 2.0f, 0, 0.3f, 0.05f,
+         [](float) { return false; }, 1.5f, Scenario::NEVER},
+        {"no breathing, light flicker 0.3 Hz", 75, hr(0), 0.5f, Band::ADULT, 2.0f, 0.05f, 0.3f, 0.05f,
+         [](float) { return false; }, 1.5f, Scenario::NEVER},
+        {"no breathing, heartbeat 0.2 px", 75, hr(0), 0.5f, Band::ADULT, 2.0f, 0, 0.3f, 0.2f,
+         [](float) { return false; }, 1.5f, Scenario::NEVER},
+    };
+    const int seeds = argc > 1 ? atoi(argv[1]) : 3;
+    if (argc > 2) {  // run only scenarios whose name contains argv[2]
+        std::vector<Scenario> f;
+        for (auto &s : sc)
+            if (std::string(s.name).find(argv[2]) != std::string::npos) f.push_back(s);
+        sc = f;
+    }
+    int fails = 0, total = 0;
+    for (auto &s : sc)
+        for (int seed = 1; seed <= seeds; seed++) {
+            fails += run(s, seed);
+            total++;
+        }
+    std::printf("%d/%d passed\n", total - fails, total);
+    return fails ? 1 : 0;
+}

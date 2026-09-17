@@ -17,6 +17,8 @@ import numpy as np
 
 W, H = 320, 240
 JUMP_MOTION = 0.04
+MIN_ROI_PIXELS = 40
+FACE_MOTION = 0.35
 MODEL = os.path.join(os.path.dirname(__file__), "models", "yunet.onnx")
 
 
@@ -139,11 +141,14 @@ def main():
                     kp = np.array([*eyes[0], *mouth[0], lm[4], lm[5], *eyes[1], *mouth[1]], float)
                     cur = np.concatenate([[x, y, x + w, y + h], kp])
                     c = ((x + w / 2), (y + h / 2))
-                    if prev_c is not None and t - prev_c[2] < 0.5:
-                        v = math.hypot(c[0] - prev_c[0], c[1] - prev_c[1]) / w / (t - prev_c[2])
-                        if v > 0.25:
+                    if prev_c is not None and t - prev_c[2] < 0.8:
+                        sc = (0.5 * c[0] + 0.5 * prev_c[0], 0.5 * c[1] + 0.5 * prev_c[1])
+                        v = math.hypot(sc[0] - prev_c[0], sc[1] - prev_c[1]) / w / (t - prev_c[2])
+                        if v > FACE_MOTION:
                             motion_until = t + 0.4
-                    prev_c = (c[0], c[1], t)
+                        prev_c = (sc[0], sc[1], t)
+                    else:
+                        prev_c = (c[0], c[1], t)
                     fresh = face is None or t - last_det_t > 2.5 or abs(c[0] - (face[0] + face[2]) / 2) > w * 0.5
                     face = cur if fresh else face + 0.3 * (cur - face)
                     last_det_t = t
@@ -170,9 +175,12 @@ def main():
                     for k, roi in enumerate(held):
                         m = roi_mean(r, g, b, roi)
                         m = (*(np.array(m[:3]) * gain[k]), m[3])
+                        if m[3] < MIN_ROI_PIXELS:
+                            m = (0.0, 0.0, 0.0, 0)
                         if m[3] and prev[k] is not None and prev[k][3]:
                             y0, y1 = sum(prev[k][:3]), sum(m[:3])
-                            if y0 > 0 and abs(y1 - y0) / y0 > JUMP_MOTION:
+                            thr = JUMP_MOTION * max(1.0, math.sqrt(200.0 / min(m[3], prev[k][3])))
+                            if y0 > 0 and abs(y1 - y0) / y0 > thr:
                                 jump_until = t + 0.3
                         prev[k] = m
                         samples.append(m)
