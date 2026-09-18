@@ -32,8 +32,8 @@ static void feed(const MotionSample &ms)
         next += 1000;
         const int n = buf.copy(tmp);
         const Result r = est.update(tmp, n, ms.t_ms);
-        std::printf("%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%.2f,%d,%d\n", (ms.t_ms - first) / 1000.0, r.brpm, r.raw,
-                    r.snr_db, r.quality, r.stability, r.agreement, r.state, r.motion, r.channels, r.best);
+        std::printf("%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%.2f,%d,%d,%d,%.2f,%.3f\n", (ms.t_ms - first) / 1000.0, r.brpm, r.raw,
+                    r.snr_db, r.quality, r.stability, r.agreement, r.state, r.motion, r.channels, r.best, r.present ? 1 : 0, r.presence, r.swing);
     }
 }
 
@@ -50,7 +50,7 @@ int main(int argc, char **argv)
                 boxes[0] = {int16_t(x), int16_t(y), int16_t(w), int16_t(h)};
         }
     }
-    std::printf("t,br,raw,snr,q,stab,agree,state,motion,channels,best\n");
+    std::printf("t,br,raw,snr,q,stab,agree,state,motion,channels,best,present,presence,swing\n");
 
     if (motion_file) {
         std::ifstream in(motion_file, std::ios::binary);

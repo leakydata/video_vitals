@@ -941,7 +941,16 @@ static void hr_task(void *)
 
         g_rest->set_band(cfg.infant ? resp::Band::INFANT : resp::Band::ADULT);
         const int64_t t1 = esp_timer_get_time();
-        const resp::Result rr = rn ? g_rest->update(rtmp, rn, now_ms) : resp::Result{};
+        resp::Result rr = rn ? g_rest->update(rtmp, rn, now_ms) : resp::Result{};
+        // Whether anything is breathing cannot be answered from an image too
+        // dark to measure it in. Below this the tile tracker's output is not
+        // merely noisy but wrong: measured at 24 px of movement in an empty,
+        // dark room, which passes every test for breathing that the movement
+        // itself can be put to. The honest answer there is that it does not
+        // know, and for a monitor that must be distinguishable from "not
+        // breathing".
+        const bool can_tell = stats.brightness >= 25;
+        if (!can_tell) rr.present = false;
         const float rms = (esp_timer_get_time() - t1) / 1000.0f;
         xSemaphoreTake(stats.mtx, portMAX_DELAY);
         stats.rr = rr;
@@ -953,7 +962,8 @@ static void hr_task(void *)
                    "reg=%d sel=%s drop=%d/%d/%d/%d breathing=%s x%.1f quiet=%.0fs band=%s est_ms=%.0f\n",
                    rr.brpm, rr.raw, rr.snr_db, rr.quality, rr.stability, rr.agreement, state_name(rr.state), rr.motion,
                    rr.channels, rr.best, rr.regions, sel[0] ? sel : "-", rr.n_nodata, rr.n_still, rr.n_masked, rr.n_weak,
-                   rr.present ? "seen" : "none", rr.presence, rr.quiet_s, cfg.infant ? "infant" : "adult", rms);
+                   can_tell ? (rr.present ? "seen" : "none") : "unknown", rr.presence, rr.quiet_s,
+                   cfg.infant ? "infant" : "adult", rms);
     }
 }
 

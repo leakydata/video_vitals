@@ -39,6 +39,7 @@ struct Result {
     // question that matters. Measured over the last few seconds only.
     bool present;      // breathing motion seen in the recent window
     float presence;    // how strong it was, relative to the detection floor
+    float swing;       // the strongest region's recent movement, in pixels
     float quiet_s;     // seconds since breathing motion was last seen
     float brpm;       // tracked breaths per minute (0 if none)
     float raw;        // this window's peak

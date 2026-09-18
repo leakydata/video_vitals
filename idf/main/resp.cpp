@@ -340,22 +340,47 @@ void Estimator::check_presence(const MotionSample *s, int n, Result &r)
 {
     constexpr float RECENT_S = 8.0f;     // long enough for one slow breath
     constexpr float FLOOR_PX = 0.03f;    // below this, nothing is moving at all
+
     const uint32_t t_end = s[n - 1].t_ms;
     float best = 0, quiet[kChan], nq = 0;
+    int best_ch = -1;
+    double best_slope = 0, best_icept = 0;
+    float best_swing = 0;
     for (int ch = 0; ch < kChan; ch++) {
         const uint64_t bit = 1ull << ch;
-        float mn = 1e9f, mx = -1e9f;
+        // A tile's displacement wanders: it is an accumulated shift, and over
+        // eight seconds the wandering is far larger than a breath. Take the
+        // movement that is left after a straight line through the window is
+        // removed -- breathing survives that, drift mostly does not.
+        double st = 0, sv = 0, stt = 0, stv = 0;
         int cnt = 0;
         for (int k = n - 1; k >= 0 && rppg::ms_diff(t_end, s[k].t_ms) < RECENT_S * 1000; k--) {
             if (!(s[k].valid & bit) || (s[k].jump & bit) || s[k].gross) continue;
-            mn = std::fmin(mn, s[k].d[ch]);
-            mx = std::fmax(mx, s[k].d[ch]);
+            const double tt = rppg::ms_diff(t_end, s[k].t_ms) / 1000.0, vv = s[k].d[ch];
+            st += tt; sv += vv; stt += tt * tt; stv += tt * vv;
             cnt++;
         }
         if (cnt < 10) continue;
+        const double den = stt - st * st / cnt;
+        const double slope = den > 1e-9 ? (stv - st * sv / cnt) / den : 0.0;
+        const double icept = (sv - slope * st) / cnt;
+        float mn = 1e9f, mx = -1e9f;
+        for (int k = n - 1; k >= 0 && rppg::ms_diff(t_end, s[k].t_ms) < RECENT_S * 1000; k--) {
+            if (!(s[k].valid & bit) || (s[k].jump & bit) || s[k].gross) continue;
+            const double tt = rppg::ms_diff(t_end, s[k].t_ms) / 1000.0;
+            const float res = float(s[k].d[ch] - (icept + slope * tt));
+            mn = std::fmin(mn, res);
+            mx = std::fmax(mx, res);
+        }
         const float swing = mx - mn;
         quiet[int(nq++)] = swing;
-        best = std::fmax(best, swing);
+        if (swing > best) {
+            best = swing;
+            best_ch = ch;
+            best_slope = slope;
+            best_icept = icept;
+            best_swing = swing;
+        }
     }
     if (nq < 4) {   // nothing usable to judge from
         r.present = false;
@@ -366,7 +391,31 @@ void Estimator::check_presence(const MotionSample *s, int n, Result &r)
     std::sort(quiet, quiet + int(nq));
     const float floor_swing = std::fmax(quiet[int(nq) / 4], FLOOR_PX);  // the scene's own restlessness
     r.presence = best / floor_swing;
-    r.present = best > FLOOR_PX && r.presence > 2.0f;
+    r.swing = best;
+    // Size alone cannot tell breathing from noise -- in a dark room the image is
+    // restless enough that the liveliest region is always lively, and by tens of
+    // pixels, not fractions of one. What separates breathing is its *shape*: it
+    // goes up and down, a bounded number of times in eight seconds, and it does
+    // so by a good fraction of its own range each time. Counting those swings
+    // needs no amplitude threshold to be tuned against a particular room, which
+    // matters because the same room measures differently by day and by night.
+    int swings = 0;
+    if (best_ch >= 0 && best > FLOOR_PX && r.presence > 2.0f) {
+        const uint64_t bit = 1ull << best_ch;
+        const float hyst = 0.25f * best_swing;   // ignore wobble within the band
+        int side = 0;
+        for (int k = 0; k < n; k++) {            // oldest first: this is a shape in time
+            if (rppg::ms_diff(t_end, s[k].t_ms) >= RECENT_S * 1000) continue;
+            if (s[k].gross || !(s[k].valid & bit) || (s[k].jump & bit)) continue;
+            const double tt = rppg::ms_diff(t_end, s[k].t_ms) / 1000.0;
+            const float res = float(s[k].d[best_ch] - (best_icept + best_slope * tt));
+            if (res > hyst && side <= 0) { if (side) swings++; side = 1; }
+            else if (res < -hyst && side >= 0) { if (side) swings++; side = -1; }
+        }
+    }
+    // 6/min is one swing in eight seconds; 78/min is about twenty. Fewer means
+    // a drift, more means something that is not breathing.
+    r.present = best > FLOOR_PX && r.presence > 2.0f && swings >= 1 && swings <= 22;
     if (r.present) {
         last_seen_ms_ = t_end;
         seen_ = true;
