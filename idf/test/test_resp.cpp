@@ -403,15 +403,18 @@ static int region_tests()
         return r;
     };
     const Result one = run_case(true), many = run_case(false);
+    // The point of grouping is not the count but what it costs: one region,
+    // however many channels saw it, must not be scored as corroborated. So the
+    // check that matters is that the overlapping case is trusted *less*.
     struct { const char *name; bool ok; } checks[] = {
         {"one region seen four ways counts as one", one.regions == 1},
         {"four separate tiles count as several", many.regions >= 3},
-        {"overlapping evidence is not credited as agreement", one.agreement <= many.agreement},
+        {"one region is trusted less than several", one.quality < many.quality},
     };
     int fails = 0;
     for (auto &c : checks) {
-        std::printf("  %-52s regions=%d/%d  %s\n", c.name, one.regions, many.regions,
-                    c.ok ? "PASS" : "FAIL");
+        std::printf("  %-52s regions=%d/%d q=%.2f/%.2f  %s\n", c.name, one.regions, many.regions,
+                    one.quality, many.quality, c.ok ? "PASS" : "FAIL");
         fails += !c.ok;
     }
     return fails;
