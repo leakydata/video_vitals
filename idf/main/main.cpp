@@ -141,6 +141,13 @@ static struct {
     int quality = 80;
     volatile bool relock = false;
     volatile bool flip_request = false;  // rotate the sensor image 180 degrees
+    // Sensor settings asked for from the command task. The camera task owns the
+    // sensor -- it is the one that windows it, flips it and reads from it -- so
+    // a request is left here and applied between frames rather than written to
+    // the sensor's registers from underneath a capture that is already running.
+    volatile int exposure_request = -1;  // AEC value, -1 = nothing pending
+    volatile int gain_request = -1;      // AGC gain, -1 = nothing pending
+    volatile bool evm_reset_request = false;
     bool flipped = false;
 } cfg;
 
@@ -461,6 +468,21 @@ static void cam_task(void *)
         if (cfg.zoom_reset) {
             cfg.zoom_reset = false;
             apply_window(ARR_W / 2, ARR_H / 2, ARR_W);
+            break_history(esp_timer_get_time());
+        }
+        if (cfg.exposure_request >= 0 || cfg.gain_request >= 0) {
+            sensor_t *sen = esp_camera_sensor_get();
+            if (cfg.exposure_request >= 0) {
+                sen->set_exposure_ctrl(sen, 0);
+                sen->set_aec_value(sen, cfg.exposure_request);
+                cfg.exposure_request = -1;
+            }
+            if (cfg.gain_request >= 0) {
+                sen->set_gain_ctrl(sen, 0);
+                sen->set_agc_gain(sen, cfg.gain_request);
+                cfg.gain_request = -1;
+            }
+            // the brightness step is not breathing, and not a pulse
             break_history(esp_timer_get_time());
         }
         if (cfg.flip_request) {
@@ -941,6 +963,10 @@ static void stream_task(void *)
         xSemaphoreTake(str_sem, portMAX_DELAY);
         // Eulerian magnification of the preview, on the device. The vitals are
         // measured from the untouched frame; this only changes what is watched.
+        if (cfg.evm_reset_request) {
+            cfg.evm_reset_request = false;
+            g_evm->reset();   // between frames, never from under one being processed
+        }
         if (cfg.magnify) {
             const int64_t t0 = esp_timer_get_time();
             g_evm->set_band(cfg.magnify == 1 ? 0.1f : 0.8f, cfg.magnify == 1 ? 0.8f : 2.5f);
@@ -1005,11 +1031,6 @@ static void handle_command(char *line)
     const char c = line[0];
     const int v = atoi(line + 1);
     sensor_t *s = esp_camera_sensor_get();
-    auto reset_history = [] {
-        xSemaphoreTake(buf_mtx, portMAX_DELAY);
-        g_buf->clear();
-        xSemaphoreGive(buf_mtx);
-    };
     switch (c) {
     case 's': cfg.stream = true; out_printf("# stream on\n"); break;
     case 'x': cfg.stream = false; out_printf("# stream off\n"); break;
@@ -1017,15 +1038,11 @@ static void handle_command(char *line)
     case 'w': cfg.samples = false; out_printf("# samples off\n"); break;
     case 'a': cfg.relock = true; break;
     case 'e':
-        s->set_exposure_ctrl(s, 0);
-        s->set_aec_value(s, std::clamp(v, 0, 1200));
-        reset_history();
+        cfg.exposure_request = std::clamp(v, 0, 1200);
         out_printf("# exposure %d\n", v);
         break;
     case 'g':
-        s->set_gain_ctrl(s, 0);
-        s->set_agc_gain(s, std::clamp(v, 0, 30));
-        reset_history();
+        cfg.gain_request = std::clamp(v, 0, 30);
         out_printf("# gain %d\n", v);
         break;
     case 'r': cfg.flip_request = true; break;
@@ -1036,7 +1053,7 @@ static void handle_command(char *line)
         break;
     case 'E':
         cfg.magnify = std::clamp(v, 0, 2);
-        if (g_evm) g_evm->reset();
+        cfg.evm_reset_request = true;   // the camera task owns the magnifier's state
         out_printf("# preview magnification %s\n",
                    cfg.magnify == 0 ? "off" : cfg.magnify == 1 ? "motion (breathing band)" : "colour (pulse band)");
         break;
