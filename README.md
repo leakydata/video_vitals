@@ -160,7 +160,26 @@ Current results:
   dark (`skin_lvl` in the `HR` line, ~120-160 is healthy); press `a` to force it.
 - The rate is reported once the tracker is `locked` (needs ~15 s).
 
-## Eulerian magnification (display only)
+## Eulerian magnification **on the device** (`E1` / `E2`)
+
+The original goal: proving Eulerian video magnification can run on a $15
+microcontroller. It does — `idf/main/evm.cpp`, **28 ms per QVGA frame** on the
+ESP32-S3 (so up to ~35 fps if frames were spare), applied to the streamed
+preview only.
+
+How it fits in 28 ms: the temporal filtering happens at a coarse pyramid level
+(40x30), so only the add-back touches every pixel, and that inner loop is a
+table lookup plus one add. The first attempt did per-pixel divisions and
+repeated PSRAM reads and took 528 ms.
+
+The amplified band is capped (+/-60 levels): the linear method assumes small
+changes, so a real movement — someone turning their head — would otherwise blow
+the picture out. Subtle motion is exaggerated; gross motion is not.
+
+**It changes only what is watched.** The vitals are always measured from the
+untouched frame, and magnification runs on the preview copy.
+
+## The same thing in the viewer (display only)
 
 Verified against the original MIT demo clips in `data/evm/`:
 - colour magnification on `face.mp4`: pulse-band swing amplified 3.1x

@@ -19,6 +19,7 @@
 //     s/x stream on/off     v/w per-frame samples on/off
 //     a   auto-expose 2 s then lock          e<n> exposure   g<n> gain
 //     q<n> JPEG quality (1-100)              m0/m1 RGB / mono(IR) mode
+//     E0/E1/E2 preview Eulerian magnification off / motion (breathing) / colour (pulse)
 //     z0/z1 sensor-window zoom off / follow the face
 //     b0/b1 breathing band adult (6-45/min) / infant (6-78/min)
 //     r   rotate image 180 degrees (also automatic when a face is upside down)
@@ -45,6 +46,7 @@
 
 #include "dl_image_jpeg.hpp"
 #include "human_face_detect.hpp"
+#include "evm.hpp"
 #include "motion.hpp"
 #include "resp.hpp"
 #include "rppg.hpp"
@@ -127,10 +129,12 @@ static rppg::Estimator *g_est;
 static resp::Buffer *g_rbuf;
 static resp::Estimator *g_rest;
 static resp::TileMotion *g_tiles;
+static evm::Magnifier *g_evm;   // preview magnification, on the device
 
 static struct {
     bool stream = false, samples = false, mono = false, infant = false;
     volatile bool zoom = false;      // follow the face with a sensor window
+    volatile int magnify = 0;        // 0 off, 1 breathing band, 2 pulse band
     volatile bool zoom_reset = false;
     int quality = 80;
     volatile bool relock = false;
@@ -142,6 +146,7 @@ static struct {
     float cam_fps = 0, det_fps = 0, det_ms = 0, det_hit = 0;
     int brightness = 0;  // mean luminance of the frame centre
     float roi_level = 0; // mean of the brightest channel of the skin ROIs
+    float evm_ms = 0;    // time spent magnifying the preview
     float roi_clip = 0;  // fraction of ROI pixels at or near saturation
     rppg::Result res{};
     resp::Result rr{};
@@ -842,10 +847,11 @@ static void hr_task(void *)
         face = g_face.valid && esp_timer_get_time() - g_face.t_us < FACE_HOLD_US;
         xSemaphoreGive(face_mtx);
         out_printf("HR bpm=%.1f raw=%.1f snr=%.1f q=%.2f stab=%.2f coh=%.2f state=%s motion=%.2f "
-                   "rois=%d face=%d det_hit=%.2f skin_lvl=%.0f fps=%.1f det_fps=%.1f det_ms=%.0f est_ms=%.0f mode=%s\n",
+                   "rois=%d face=%d det_hit=%.2f skin_lvl=%.0f fps=%.1f det_fps=%.1f det_ms=%.0f est_ms=%.0f evm_ms=%.1f "
+                   "mode=%s\n",
                    r.bpm, r.bpm_raw, r.snr_db, r.quality, r.stability, r.coherence, state_name(r.state),
-                   r.motion, r.rois_used, face, stats.det_hit, stats.roi_level, stats.cam_fps, stats.det_fps, stats.det_ms, ms,
-                   cfg.mono ? "mono" : "rgb");
+                   r.motion, r.rois_used, face, stats.det_hit, stats.roi_level, stats.cam_fps, stats.det_fps,
+                   stats.det_ms, ms, stats.evm_ms, cfg.mono ? "mono" : "rgb");
 
         g_rest->set_band(cfg.infant ? resp::Band::INFANT : resp::Band::ADULT);
         const int64_t t1 = esp_timer_get_time();
@@ -869,6 +875,18 @@ static void stream_task(void *)
 {
     for (;;) {
         xSemaphoreTake(str_sem, portMAX_DELAY);
+        // Eulerian magnification of the preview, on the device. The vitals are
+        // measured from the untouched frame; this only changes what is watched.
+        if (cfg.magnify) {
+            const int64_t t0 = esp_timer_get_time();
+            g_evm->set_band(cfg.magnify == 1 ? 0.1f : 0.8f, cfg.magnify == 1 ? 0.8f : 2.5f);
+            g_evm->set_alpha(cfg.magnify == 1 ? 12.0f : 30.0f);
+            static uint32_t prev_t = 0;
+            const float dt = prev_t ? std::clamp(rppg::ms_diff(str_t_ms, prev_t) / 1000.0f, 0.01f, 0.5f) : 0.07f;
+            prev_t = str_t_ms;
+            g_evm->process_yuyv(str_frame, W, H, dt);
+            stats.evm_ms = 0.9f * stats.evm_ms + 0.1f * (esp_timer_get_time() - t0) / 1000.0f;
+        }
         dl::image::img_t img = {str_frame, W, H, dl::image::DL_IMAGE_PIX_TYPE_YUYV};
         dl::image::jpeg_img_t jpg = dl::image::sw_encode_jpeg(img, cfg.quality);
         if (jpg.data) {
@@ -935,6 +953,12 @@ static void handle_command(char *line)
     case 'm':
         cfg.mono = v != 0;
         out_printf("# mode %s\n", cfg.mono ? "mono" : "rgb");
+        break;
+    case 'E':
+        cfg.magnify = std::clamp(v, 0, 2);
+        if (g_evm) g_evm->reset();
+        out_printf("# preview magnification %s\n",
+                   cfg.magnify == 0 ? "off" : cfg.magnify == 1 ? "motion (breathing band)" : "colour (pulse band)");
         break;
     case 'z':
         cfg.zoom = v != 0;
@@ -1014,9 +1038,10 @@ extern "C" void app_main(void)
     g_rbuf = new (std::nothrow) resp::Buffer();
     g_rest = new (std::nothrow) resp::Estimator();
     g_tiles = new (std::nothrow) resp::TileMotion();
+    g_evm = new (std::nothrow) evm::Magnifier();
     det_frame = (uint8_t *)heap_caps_malloc(W * H * 2, MALLOC_CAP_SPIRAM);
     str_frame = (uint8_t *)heap_caps_malloc(W * H * 2, MALLOC_CAP_SPIRAM);
-    if (!g_buf || !g_est || !g_rbuf || !g_rest || !g_tiles || !det_frame || !str_frame || !out_mtx ||
+    if (!g_buf || !g_est || !g_rbuf || !g_rest || !g_tiles || !g_evm || !det_frame || !str_frame || !out_mtx ||
         !face_mtx || !buf_mtx || !stats.mtx || !det_sem || !str_sem) {
         fatal("out of memory during start-up");
     }
