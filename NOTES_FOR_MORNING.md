@@ -250,6 +250,19 @@ hangs — so the region you drew over the cot would quietly stop applying while 
 carried on drawing it. That is the sort of thing that would have looked like "the monitor
 just stopped working overnight" and been very hard to explain afterwards.
 
+A third pass checked the tests themselves, by running each new check against code broken
+in the way it is supposed to catch. **Two of the three region checks did not notice** — they
+passed just as happily with the grouping removed entirely, because they asserted on the
+agreement *number*, and one region whose single vote agrees still scores 1.00. What
+grouping actually changes is what that agreement is worth. They now assert the quality
+penalty, and against ungrouped code they fail.
+
+The rest do discriminate, each verified against deliberately broken code: box jitter, the
+over-long box slide, coherence expiry, the infant band at 70/min, region grouping, and
+presence — against a detector that always claims breathing, both "notices it stopping"
+checks fail as they should. The streaming rewrite of `session_report.py` also produces
+byte-identical output to the version it replaced, on a 15 MB recording.
+
 One observation while I was in there, not a bug and not new: the breathing estimator takes
 about **280 ms per update** when the channels are live — roughly a third of a core, once a
 second. Tonight's changes did not add to it (measured on identical input: 1.19 s before,
