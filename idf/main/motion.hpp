@@ -62,6 +62,11 @@ private:
     float cur_brow_[kBoxes][kBoxProf], cur_bcol_[kBoxes][kBoxProf];
     float ref_brow_[kBoxes][kBoxProf], ref_bcol_[kBoxes][kBoxProf];
     Box box_ref_[kBoxes] = {};   // the box each reference profile belongs to
+    // Where the box sat when each box channel's reference profile was taken.
+    // The profile is measured in box coordinates, so moving the box shifts the
+    // content against the reference even when nothing in the scene moved; the
+    // shift is known exactly from the geometry and is subtracted out.
+    float gref_[2 * kBoxes] = {};
     bool have_box_[kBoxes] = {};
 };
 

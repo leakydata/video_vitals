@@ -175,8 +175,14 @@ void TileMotion::process_yuyv(const uint8_t *px, int w, int h, uint32_t t_ms, bo
             continue;
         }
         box_profiles(px, w, h, b, i);
-        const bool moved = !have_box_[i] || std::abs(b.x - box_ref_[i].x) > 2 || std::abs(b.y - box_ref_[i].y) > 2 ||
-                           std::abs(b.w - box_ref_[i].w) > 2 || std::abs(b.h - box_ref_[i].h) > 2;
+        // A box that has merely slid can keep its reference, because the shift
+        // that causes is known from the geometry and is corrected below. Only a
+        // resize (which stretches the profile rather than shifting it) or a move
+        // far enough to look at different content needs a new reference.
+        const bool moved = !have_box_[i] || std::abs(b.w - box_ref_[i].w) > 2 ||
+                           std::abs(b.h - box_ref_[i].h) > 2 ||
+                           std::abs(b.x - box_ref_[i].x) > b.w / 8 ||
+                           std::abs(b.y - box_ref_[i].y) > b.h / 8;
         if (moved) {
             // the box moved: its old reference means nothing, and the step that
             // causes must not be read as breathing
@@ -188,6 +194,7 @@ void TileMotion::process_yuyv(const uint8_t *px, int w, int h, uint32_t t_ms, bo
                 const int ch = kBoxChan0 + 2 * i + axis;
                 out.jump |= 1ull << ch;
                 off_[ch] = last_[ch];
+                gref_[2 * i + axis] = axis == 0 ? b.y : b.x;
             }
         }
         for (int axis = 0; axis < 2; axis++) {
@@ -199,10 +206,18 @@ void TileMotion::process_yuyv(const uint8_t *px, int w, int h, uint32_t t_ms, bo
             float d;
             if (!lk_shift(ref, cur, kBoxProf, d)) {
                 std::memcpy(ref, cur, sizeof(float) * kBoxProf);
+                gref_[2 * i + axis] = axis == 0 ? b.y : b.x;
                 out.d[ch] = off_[ch] * px_per_bin;
                 continue;
             }
-            const float disp = off_[ch] + d;
+            // The box has moved by this much since the reference was taken, so a
+            // perfectly still scene reads as an equal and opposite shift. Add it
+            // back: what is wanted is how the chest moved, not how the face
+            // detector's idea of where it is moved. Without this, a detector
+            // jittering by a pixel is indistinguishable from shallow breathing.
+            const float origin = axis == 0 ? b.y : b.x;
+            const float geom = (origin - gref_[2 * i + axis]) / px_per_bin;
+            const float disp = off_[ch] + d + geom;
             if (std::fabs(disp - last_[ch]) > JUMP_STEP) {
                 jumps++;
                 out.jump |= 1ull << ch;
@@ -210,9 +225,10 @@ void TileMotion::process_yuyv(const uint8_t *px, int w, int h, uint32_t t_ms, bo
             last_[ch] = disp;
             out.d[ch] = disp * px_per_bin;
             out.valid |= 1ull << ch;
-            if (std::fabs(d) > REKEY) {
+            if (std::fabs(d + geom) > REKEY) {
                 off_[ch] = disp;
                 std::memcpy(ref, cur, sizeof(float) * kBoxProf);
+                gref_[2 * i + axis] = origin;
             }
         }
     }
@@ -226,6 +242,10 @@ void TileMotion::process_yuyv(const uint8_t *px, int w, int h, uint32_t t_ms, bo
         std::memcpy(ref_col_, cur_col_, sizeof(ref_col_));
         std::memcpy(ref_brow_, cur_brow_, sizeof(ref_brow_));
         std::memcpy(ref_bcol_, cur_bcol_, sizeof(ref_bcol_));
+        for (int i = 0; i < kBoxes; i++) {
+            gref_[2 * i] = boxes[i].y;
+            gref_[2 * i + 1] = boxes[i].x;
+        }
         for (int ch = 0; ch < kChan; ch++) off_[ch] = last_[ch];
     }
 }

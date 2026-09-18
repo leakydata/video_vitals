@@ -239,6 +239,62 @@ static int feed_tests()
     return fails;
 }
 
+// The chest box is anchored to the face box, and the face detector's idea of
+// where the face is wobbles by a pixel or two between frames even when nobody
+// moves. Since the box profile is measured in box coordinates, that wobble
+// shifts the content against the reference and reads as motion -- at exactly the
+// amplitude real breathing has. Check that a jittering box on a frozen scene
+// reports nothing, while a still box over moving content still reports it.
+static int box_jitter_tests()
+{
+    Scene scene;
+    scene.build(3);
+    std::vector<uint8_t> frame(W * H * 2);
+    auto render = [&](float content_dy) {
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) {
+                const bool chest = x >= 70 && x < 250 && y >= 130;
+                const float v = chest ? scene.sample(scene.person, x, y - content_dy)
+                                      : scene.sample(scene.bg, x, y);
+                frame[(y * W + x) * 2] = uint8_t(std::clamp(v, 0.0f, 255.0f));
+                frame[(y * W + x) * 2 + 1] = 128;
+            }
+    };
+    // returns the peak-to-peak vertical displacement the chest box reported
+    auto run = [&](bool jitter_box, bool move_content) {
+        TileMotion tm;
+        float lo = 1e9f, hi = -1e9f;
+        for (int f = 0; f < 120; f++) {
+            const float t = f / 20.0f;
+            const float content = move_content ? std::sin(2 * float(M_PI) * 0.25f * t) : 0.0f;
+            render(content);
+            // a detector wobble of a pixel or two, the size seen in practice
+            const int16_t dy = jitter_box ? int16_t(std::lround(std::sin(2 * float(M_PI) * 0.25f * t))) : 0;
+            const Box boxes[kBoxes] = {{70, int16_t(130 + dy), 180, 100}, {120, 30, 80, 100}};
+            MotionSample ms;
+            tm.process_yuyv(frame.data(), W, H, uint32_t(t * 1000), false, boxes, ms);
+            if (f < 40) continue;  // let the reference settle
+            if (!(ms.valid & (1ull << kBoxChan0))) continue;
+            lo = std::fmin(lo, ms.d[kBoxChan0]);
+            hi = std::fmax(hi, ms.d[kBoxChan0]);
+        }
+        return hi - lo;
+    };
+    const float jitter_only = run(true, false);
+    const float content_only = run(false, true);
+    struct { const char *name; bool ok; } checks[] = {
+        {"a jittering box on a frozen scene reports no motion", jitter_only < 0.4f},
+        {"a still box over moving content still reports it", content_only > 1.0f},
+    };
+    int fails = 0;
+    for (auto &c : checks) {
+        std::printf("  %-52s jitter=%.2f content=%.2f px  %s\n", c.name, jitter_only, content_only,
+                    c.ok ? "PASS" : "FAIL");
+        fails += !c.ok;
+    }
+    return fails;
+}
+
 // One movement seen through several overlapping regions must not be counted as
 // several independent witnesses. Feed the same oscillation twice: once confined
 // to a single tile and the chest box lying over it (four channels, one physical
@@ -320,7 +376,7 @@ int main(int argc, char **argv)
             if (std::string(s.name).find(argv[2]) != std::string::npos) f.push_back(s);
         sc = f;
     }
-    int fails = feed_tests() + region_tests(), total = 8;
+    int fails = feed_tests() + region_tests() + box_jitter_tests(), total = 10;
     for (auto &s : sc)
         for (int seed = 1; seed <= seeds; seed++) {
             fails += run(s, seed);
