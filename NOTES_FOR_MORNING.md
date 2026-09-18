@@ -1,201 +1,130 @@
-# Overnight notes — 17/18 September 2026
+# Morning notes — 18 September 2026
 
-You asked Codex (gpt-6-astra) to review everything, for me to implement what I judged
-right, and to flag what I was unsure of. Here it is.
-
-Everything below is committed and pushed to the private repo. Heart-rate tests
-**105/105**, breathing **41/41**, both under stricter scoring than yesterday. The
-board is flashed with all of it and was running overnight.
+Everything below is committed and pushed. Tests: **heart rate 107/107, breathing 53/53**,
+with eleven new checks written last night. The board is flashed and has been running
+unattended since you went to bed. Last night's notes are now in `docs/notes_2026-09-17.md`.
 
 ---
 
-## The review's most important finding
+## The empty-room test finally ran, and it passed
 
-**The tests were scoring only the last ten seconds of each run.** A scenario could
-report 144 bpm for a true 72 bpm — locked, quality 1.00 — and still pass, because the
-error happened before the scoring window. Codex reproduced exactly that in the binary I
-had been quoting "105/105 passed" from.
+This is the one I most wanted and could not run while you were in the chair.
 
-So yesterday's test numbers were weaker evidence than I presented them as. The tests now
-check **every confident output for the whole run**, "must not lock" scenarios must not
-lock even once, and lag/settling limits are asserted rather than merely printed. The
-same tightening was applied to the breathing tests.
-
-That change then exposed a real octave bug, which is fixed (below).
+**962 windows with nobody in the room: no heart rate reported, no breathing rate
+reported, not once.** No restarts, no errors, no camera failures. The six-window lock
+requirement I added the night before is holding.
 
 ---
 
-## Implemented (with the reasoning)
+## Your face is no longer cut off when it zooms
 
-**Truthfulness of readings**
-- An unresolved octave now caps quality *below* the lock threshold rather than halving
-  it — halving could still land exactly on the threshold and lock.
-- A half-period that fits the waveform better than the chosen peak is now treated as
-  doubt in itself, not only when it also has strong spectral support. This is what fixed
-  the 72→144 error.
-- A window that is accepted but too weak to count as good now **decays an existing
-  lock**. Before, marginal evidence could sustain a lock indefinitely.
-- Readings expire in the viewer after five seconds and are cleared on disconnect, so a
-  stale number cannot sit on screen looking current.
+Two separate causes, both fixed, and this time **measured over 85 frames** rather than
+eyeballed: the face box is wholly inside the frame in every frame, with 0.40 face-heights
+of headroom, and the chest box stays in view.
 
-**Firmware bugs**
-- The ROI fallback divided by the luminance-valid pixel count while summing only
-  unclipped pixels — so a changing clipped fraction appeared as a brightness change.
-- The 180° rotation for upside-down detection swapped the chroma bytes instead of the
-  two luma samples (wrong colours, degraded detection during orientation recovery).
-- The zoom trigger compared an unclamped target window, so a centred subject could never
-  satisfy the size condition — "zoom on" sometimes did nothing.
-- Gross-motion re-keying moved the chest/head offsets without replacing their reference
-  profiles, counting their displacement twice.
-- Invalid chest/head channels were serialised uninitialised (garbage in recordings).
-- Exposure changes now invalidate breathing history too; previously only heart rate's.
-- Exposure recovery no longer depends on having a valid ROI — a big enough lighting
-  change could stranding the device permanently, which matters for unattended runs.
-- Allocation and task-creation failures now stop the device with a fast-blinking LED
-  instead of quietly running half-initialised.
+1. It aimed from a **stale detection** — after the window moves, the last known face
+   position describes the *old* view, so the aim was computed in the wrong frame of
+   reference and walked the crop off you.
+2. The crop was sized from face **width**, so a turned head (narrow box) tightened it at
+   exactly the wrong moment. It is now sized from what has to fit, driven by face height,
+   which barely changes when you turn.
 
-**Tools**
-- The viewer was rejecting *every* motion record (wrong token count after the `subject`
-  field was added) and `sel=` lost all but the first region — so the breathing waveform
-  and most region outlines were missing. Fixed.
-- `--headless` no longer opens a window (it failed on machines without a display).
-- The noise benchmark ignored validity, so an untracked channel scored as perfectly
-  quiet and could win "quietest half". It now requires tracked, unflagged samples and
-  reports coverage.
-- The radar comparison scored stale values as fresh pairs; each rate now has its own
-  freshness.
-- The session report looked for pacer annotations inside the recording; they live in the
-  `.marks.txt` sidecar.
-
-**Honesty correction to a number I gave you**
-- `tools/video_to_samples.py` still simulated the old RGB565 capture while the firmware
-  moved to YUV422, so the UBFC result described a pipeline the device no longer uses.
-  With true parity: **1.97 bpm mean error, locked 94%** (I had been quoting 1.82 / 100%).
+A face touching the edge also re-aims after 3 s now instead of waiting out the 20 s rate
+limit.
 
 ---
 
-## Not implemented — your call (ranked by how much I think they matter)
+## All five remaining review items are done
 
-1. **Breathing presence is not the same as breathing rate.** For the baby monitor this
-   is the big one. The estimator can keep reporting a rate computed from breaths that
-   happened up to 30 s ago; fresh camera frames satisfy the staleness check even if
-   breathing has *stopped*. A monitor needs a separate "is there breathing motion right
-   now" detector with a measured detection latency. I didn't build it because it needs a
-   design decision from you: how fast must it notice, and what should it do then.
-2. **Fusion agreement overstates independence.** Tiles, boxes and the two axes overlap,
-   so eight "agreeing regions" can be one artefact seen eight times. Grouping by physical
-   region would make agreement mean what it claims. Moderate work, improves honesty of
-   the quality score rather than accuracy.
-3. **Camera-failure recovery and task watchdogs.** Capture currently retries forever with
-   no recovery state machine, and there are no task heartbeats. Needed before anything
-   runs unattended all night.
-4. **Anti-aliasing costs infant-band sensitivity.** Codex calculates ≈ −8 dB at 1.3 Hz
-   (78 breaths/min). Fine for adults, possibly significant for a newborn. Wants a proper
-   passband/stopband specification across both frame rates.
-5. **Box tracking can measure detector jitter.** A one-pixel change in the face box
-   shifts the sampled profile against a reference taken at different coordinates. Would
-   need the geometry held within the dead band or the shift compensated.
-6. **Cross-task configuration handoff.** Settings are written from the command task while
-   the camera task may be mid-sequence. No misbehaviour observed, but it is a real race;
-   the clean fix is a command queue plus a settings generation stamp. Bigger refactor.
-7. **Coherence is not re-checked after acquisition.** I made marginal windows decay a
-   lock, which partly covers it, but renewed cross-region evidence over time would be
-   better.
+Each one is a correctness fix, and each came with a measurement showing it mattered.
 
----
+**Detector jitter was being read as breathing.** The chest box is anchored to the face
+box, and the detector's idea of where your face is wobbles a pixel or two between frames.
+On a **completely frozen scene**, that wobble produced **2.16 px** of apparent motion —
+*more* than real 2 px movement produces. The box's displacement is known exactly, so it is
+now subtracted; the same test reports 0.23 px.
 
-## Measured last night
+**Agreement between regions was being overcounted.** The two axes of one tile, and a box
+together with the tiles beneath it, all watch the same piece of you. One artefact seen
+four ways scored as four agreeing witnesses. Regions that overlap now merge and cast one
+vote between them.
 
-- Breathing, you sitting still: **locked at 8.1–8.2 /min, quality 0.85, all regions
-  agreeing** — consistent with your 9–12 resting range.
-- Heart rate struggled while you were turned away: no face, so no reading. Expected.
-- Zoom A/B from earlier: breathing locked 56% of windows zoomed against 4% wide.
+**The anti-alias filter was leaning on the infant band.** Six one-poles at 2 Hz cost about
+8 dB at 78 breaths/min, which biased every comparison toward the slower candidate. Its
+response is now divided back out of the spectrum. At 70/min over five seeds: it used to
+lock on three and fail completely on two; now all five lock, within 0.05 /min.
 
-## The overnight test (you left the chair — thank you)
+**A heart-rate lock never had to re-earn its evidence.** Coherence across the face regions
+is what separates a pulse from anything else periodic, and it was checked only while
+acquiring — after four good windows it stopped mattering for good. A lock could then be
+carried indefinitely by any steady rhythm in one region. It may now ride out ten windows
+without coherent evidence, not more.
 
-**Heart rate never reported anything with nobody there.** 885 windows, all `no_signal`.
-That is exactly right and is the result I most wanted.
-
-**Breathing produced one false lock in 885 windows** (~1 per 15 minutes): 14.3 /min,
-with perfect stability and all regions agreeing. Something in your room genuinely
-oscillates at about that rate — a fan, a curtain, the camera swaying on its cable — so
-the quality checks cannot tell it from a person breathing. That single window had
-neighbours just below threshold, so I now require **six consecutive good windows for a
-breathing lock** (heart rate keeps four). Both suites still pass.
-
-I could not verify the fix on the same conditions, because by then **the room had gone
-dark** (brightness 6/255). In darkness the tile tracker flags nearly every window as
-movement — image noise moves the profiles around — so the device reported nothing at
-all for the rest of the night. That is safe behaviour, but it is worth knowing:
-
-- **Without light, there is no measurement.** Not a surprise, but now measured.
-- It strengthens the case for IR: a fixed infrared lamp gives constant, even light with
-  no daylight variation, no screen flicker and no glare. The night case may well measure
-  *better* than your desk does by day.
-- The noise-driven motion flags in the dark are worth revisiting when the IR hardware
-  arrives: if the IR image is dim, the same flagging could mask real breathing. A
-  noise-aware jump threshold (or the fit-residual check Codex suggested) would fix it.
-
-**What would make the empty-room test conclusive:** leave a lamp on with nobody in the
-room. Happy to run that any time.
-
-## Waiting on you
-
-- **Empty-room test.** Say the word when you're away from the desk and I'll check whether
-  it invents readings with nobody there. That is the single most important test for the
-  baby-monitor idea, and I can't run it while you're in the chair.
-- OV5640 arriving Saturday: `tools/noise_bench.py` will compare it in five minutes.
-- EMAY monitor: passive breathing reference, no paced breathing needed.
+**The command task was writing to the sensor from under a running capture.** Exposure and
+gain went straight to the camera's registers while the camera task was capturing,
+windowing or flipping it. Those now follow the pattern rotation already used: leave a
+request, and the task that owns the hardware applies it between frames. Verified live on
+the board (e600 and g12 both read back correctly).
 
 ---
 
-# Addendum — late 18 September
+## The presence detector did not work, and I could not make it work
 
-## Zoom was cutting your face off again
+This is the important one, and it is bad news honestly reported.
 
-Two causes, both fixed and **measured** rather than eyeballed:
+I built breathing *presence* the night before — "is anything breathing right now",
+separate from the rate. I measured it last night against real recordings:
 
-1. **It aimed from a stale face.** After the sensor window moves, the last known face
-   position describes the *old* view, so the next aim was computed in the wrong frame of
-   reference and walked the crop off you. The face is now invalidated whenever the window
-   moves, and only a detection less than 0.7 s old may aim the crop.
-2. **The crop was sized by a fixed multiple of face width** with a downward bias for the
-   chest. A turned head has a narrow box, so the crop tightened just when it shouldn't.
-   It is now sized from what actually has to fit: 0.40 face-heights of headroom above the
-   detector's box (which stops at your hairline), the face, and 1.05 below for the chest.
-   Face *height* drives it, which barely changes when you turn your head.
+| | breathing reported |
+|---|---|
+| Empty, dark room | **99% of windows** |
+| You in the chair | 100% of windows |
 
-Also: a face touching the frame edge now re-aims after 3 s instead of waiting out the 20 s
-rate limit, and widens 15% while doing it. Previously a slightly-off crop stayed wrong for
-twenty seconds.
+It was not detecting breathing. It was detecting that the image was moving.
 
-**Measured over 85 frames with you in the chair:** face box fully inside the frame in
-every frame, headroom 0.40 face-heights (24 px at worst), chest box in view throughout.
-Before the fix the same check showed the head against the edge.
+The cause is that **in darkness the tile tracker does not merely get noisy, it goes
+wrong**: the strongest region swings by about **24 px** over eight seconds with nobody in
+the room. I tried three ways to tell that apart from breathing and measured each:
 
-The chest box is still trimmed at the bottom edge by roughly a fifth. That is deliberate —
-the estimator accepts a partial chest box, and nothing tolerates half a face.
+- require neighbouring regions to move together → 99% empty / 87% occupied (in the dark
+  the false movement is globally correlated too)
+- remove a straight-line drift first → 98% / 84% (it is not drift)
+- require it to swing up and down the bounded number of times breathing does → 99% / 87%
+  (it does that as well)
 
-## Also done tonight
+None of them separated the two. So presence now reports **`unknown`** below the brightness
+the firmware already treats as unmeasurable, which is confirmed working on the board. For
+a monitor, "I cannot tell" has to be distinguishable from "not breathing" — a false
+*"breathing"* is precisely the failure that would hide a real stoppage.
 
-- **Camera recovery and task watchdogs** (was open item 3). Each of the camera, detector
-  and heart-rate tasks stamps a heartbeat; if any stops for 20 s the device restarts
-  itself. Capture failures reinitialise the camera every 20 failures and stop the device
-  after 200. This is what was missing before anything ran unattended all night.
-- **Breathing presence** (was open item 1, the one I said needed a decision from you).
-  A first cut: each region's recent 8 s swing is compared against the quietest quartile's
-  floor, and the RR line now says `breathing=seen|none xN quiet=Ns`. This answers "is
-  something moving like breathing right now", separately from the rate. It does **not**
-  yet have a measured detection latency or an alarm policy — that is still your call:
-  how fast must it notice, and what should it do then.
-- `heartcam.py --zoom` starts with the zoom on, so a viewer restart no longer loses it.
+What does work, measured with a new test: when the light is adequate, presence appears
+**0.6 s** after breathing starts and disappears **7.1 s** after it stops, including for
+0.12 px movement — an infant, or a chest under a blanket. Those numbers are the
+specification for whatever alarm policy you decide on.
 
-Tests: heart rate **105/105**, breathing **41/41**.
+**This needs daylight data.** Everything I had to calibrate against was recorded in a dim
+room. A recording of you in normal daylight, and one of the empty room with a lamp on,
+would let me set the trust threshold from evidence instead of from the one constant the
+firmware already had.
 
-## Still open from the review
+---
 
-2. Fusion agreement overstates independence (overlapping regions counted separately).
-4. Anti-aliasing costs infant-band sensitivity (≈ −8 dB at 1.3 Hz).
-5. Box tracking can measure detector jitter.
-6. Cross-task configuration handoff is a real race, no misbehaviour seen.
-7. Coherence is not re-checked after acquisition.
+## Two things need you
+
+**1. Codex never ran.** Five attempts, all rejected before it read a line of code:
+`gpt-6-astra` needs a newer Codex than the plugin's bundled one (I upgraded the global CLI
+to 0.155.0; it made no difference, so the plugin ships its own), and `gpt-5.3-codex-spark`
+and `gpt-5-codex` are both refused for a ChatGPT-tier account. The path that *did* work
+earlier — running `codex exec` directly in a shell — is now blocked for me by Claude
+Code's permission classifier, which is your decision to make, not mine: a Bash permission
+rule for `codex` would unblock it. The review prompt is written and ready at
+`scratchpad/review3_prompt.txt`.
+
+**2. The presence alarm policy**, once there is daylight data: how fast must it notice
+breathing stopping, and what should it do then. The 7.1 s figure above is what it can
+currently offer.
+
+## Waiting on hardware
+
+- OV5640 on Saturday — `tools/noise_bench.py` compares it in five minutes.
+- EMAY monitor — a passive breathing reference, no paced breathing needed.
