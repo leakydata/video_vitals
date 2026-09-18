@@ -84,6 +84,18 @@ class Device(threading.Thread):
             self.marks.write(f"{time.time():.3f} {text}\n")
             self.marks.flush()
 
+    def set(self, cmd):
+        """Send a setting and remember it, so a reconnect restores it.
+
+        The board forgets everything when it restarts -- and it now restarts
+        itself if a task hangs -- so a watch region or a band chosen an hour ago
+        would silently stop applying while the viewer still drew it. Settings
+        are keyed by their command letter, so choosing a new one replaces the
+        old rather than stacking up.
+        """
+        self.startup = [c for c in self.startup if c[0] != cmd[0]]
+        self.send(cmd, startup=True)
+
     def send(self, cmd, startup=False):
         if startup:
             self.startup.append(cmd)
@@ -542,7 +554,9 @@ def main():
                         cv2.putText(right, VIEWS[view_mode] + " magnified", (6, 14),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
                         view = cv2.resize(np.hstack([left, right]), None, fx=scale, fy=scale)
-            if drag.pop("done", False):
+            # a drag that began on the video says "watch here"; one that began
+            # in the readout below it is not aimed at anything
+            if drag.pop("done", False) and drag["a"][1] <= 240 * scale:
                 (ax, ay), (bx, by) = drag["a"], drag["b"]
                 x0, x1 = sorted((int(ax / scale), int(bx / scale)))
                 y0, y1 = sorted((int(ay / scale), int(by / scale)))
@@ -550,7 +564,7 @@ def main():
                 y0, y1 = max(0, min(239, y0)), max(0, min(240, y1))
                 if x1 - x0 > 16 and y1 - y0 > 16:
                     watch = (x0, y0, x1 - x0, y1 - y0)
-                    dev.send(f"C{watch[0]},{watch[1]},{watch[2]},{watch[3]}")
+                    dev.set(f"C{watch[0]},{watch[1]},{watch[2]},{watch[3]}")
                     print(f"[viewer] watching {watch}")
             if view is None:
                 view = np.zeros((int(240 * scale), int(320 * (1 if args.single else 2) * scale), 3), np.uint8)
@@ -646,7 +660,7 @@ def main():
                 print(f"[viewer] right-hand view: {VIEWS[view_mode]}")
             elif key == ord("c"):
                 watch = None
-                dev.send("C0")
+                dev.set("C0")
                 print("[viewer] watch region cleared")
             elif key == ord("a"):
                 dev.send("a")
@@ -662,15 +676,15 @@ def main():
                 dev.mark(f"pacer {'on' if pacer_on else 'off'} rate={pacer_rate:.0f} t={time.time():.3f}")
             elif key == ord("E"):
                 dev_mag = (dev_mag + 1) % 3
-                dev.send(f"E{dev_mag}")
+                dev.set(f"E{dev_mag}")
                 print(f"[viewer] board magnification: {('off', 'motion', 'pulse')[dev_mag]}")
             elif key == ord("z"):
                 zoom = not zoom
-                dev.send("z1" if zoom else "z0")
+                dev.set("z1" if zoom else "z0")
             elif key == ord("b"):
-                dev.send("b1" if dev.rr.get("band") != "infant" else "b0")
+                dev.set("b1" if dev.rr.get("band") != "infant" else "b0")
             elif key == ord("M"):
-                dev.send("m1" if h.get("mode") != "mono" else "m0")
+                dev.set("m1" if h.get("mode") != "mono" else "m0")
             elif key in (ord("+"), ord("="), ord("-")):
                 exposure = int(np.clip(exposure + (50 if key != ord("-") else -50), 0, 1200))
                 dev.send(f"e{exposure}")

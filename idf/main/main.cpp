@@ -1141,6 +1141,14 @@ static void cmd_task(void *)
 }
 
 // Blink the LED fast and say why, rather than running on in an unknown state.
+// Stops this task and blinks fast. If the tasks are already running when this
+// is reached, the watchdog in led_task will see this one stop stamping and
+// restart the device about twenty seconds later -- which is what an unattended
+// monitor should do, since a reboot may clear a transient fault and a device
+// blinking quietly to itself in a nursery helps nobody. Reached before the
+// tasks start (an allocation that failed at boot), there is no watchdog yet and
+// the blinking is all there is, which is also right: a reboot would only repeat
+// it.
 [[noreturn]] static void fatal(const char *why)
 {
     ESP_LOGE(TAG, "fatal: %s", why);
@@ -1199,6 +1207,10 @@ extern "C" void app_main(void)
         {hr_task, "hr", 24576, 5, 1},    {stream_task, "stream", 8192, 3, 0},
         {led_task, "led", 2048, 2, 1},   {cmd_task, "cmd", 4096, 5, 0},
     };
+    // Start every heartbeat now, so the watchdog's deadline is measured from
+    // when the tasks began rather than from boot. Otherwise a slow start is
+    // indistinguishable from a task that has hung.
+    for (auto &b : beats) b.store(esp_timer_get_time(), std::memory_order_relaxed);
     for (const auto &t : tasks)
         if (xTaskCreatePinnedToCore(t.fn, t.name, t.stack, nullptr, t.prio, nullptr, t.core) != pdPASS)
             fatal("could not start a task");
