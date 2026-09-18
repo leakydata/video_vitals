@@ -91,6 +91,9 @@ private:
     float w_[N];  // 1 = clean, 0 = motion (tapered)
     float P_[kRois][NB_EXT];
     float pulse_[N];
+    // How many windows in a row have shown no cross-ROI coherence. A lock is
+    // allowed to ride out a few, but not to live on evidence that has expired.
+    int coh_miss_ = 0;
 
     Tracker trk_;
 };

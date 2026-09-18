@@ -125,6 +125,62 @@ static int run(const Scenario &sc, unsigned seed)
     return ok ? 0 : 1;
 }
 
+// A lock must not outlive the evidence that made it. Give the estimator a real,
+// cross-region pulse until it locks, then take the agreement away: the same
+// rhythm continues, but in one region only, which is what an artefact looks
+// like. The reading has to let go.
+static int coherence_tests()
+{
+    static Estimator est;
+    static Buffer buf;
+    static Sample tmp[kCap];
+    est.reset();
+    est.set_mode(Mode::RGB);
+    buf.clear();
+    std::mt19937 rng(11);
+    std::normal_distribution<float> gauss(0, 1);
+    const float base[kRois][3] = {{175, 115, 95}, {165, 105, 88}, {168, 108, 90}};
+    const float pv[3] = {0.33f, 0.77f, 0.53f};
+    const float SOLO_AFTER = 60.0f;
+    float phase = 0, t = 0, next = 1;
+    bool locked_while_coherent = false, locked_at_end = false;
+    while (t < 110) {
+        t += 0.055f;
+        phase += 2 * float(M_PI) * (72.0f / 60) * t * 0 + 2 * float(M_PI) * (72.0f / 60) * 0.055f;
+        const float p = std::sin(phase) + 0.3f * std::sin(2 * phase + 0.5f);
+        const bool solo = t > SOLO_AFTER;
+        Sample s{};
+        s.t_ms = uint32_t(t * 1000);
+        for (int r = 0; r < kRois; r++) {
+            float c[3];
+            for (int k = 0; k < 3; k++) {
+                // after the changeover only one region carries the rhythm, so
+                // the regions no longer agree even though the rate is unchanged
+                const float amp = (solo && r != 0) ? 0.0f : 0.004f;
+                c[k] = base[r][k] * (1 + amp * pv[k] * p) + 0.15f * (1 + 0.5f * r) * gauss(rng);
+            }
+            s.roi[r] = {c[0], c[1], c[2], 400};
+        }
+        buf.push(s);
+        if (t >= next) {
+            next += 1;
+            const Result r = est.update(tmp, buf.copy(tmp), s.t_ms);
+            if (t < SOLO_AFTER && r.state == LOCKED) locked_while_coherent = true;
+            if (t > 105) locked_at_end = r.state == LOCKED;
+        }
+    }
+    struct { const char *name; bool ok; } checks[] = {
+        {"locks while the regions agree", locked_while_coherent},
+        {"lets go once only one region carries it", !locked_at_end},
+    };
+    int fails = 0;
+    for (auto &c : checks) {
+        std::printf("  %-52s %s\n", c.name, c.ok ? "PASS" : "FAIL");
+        fails += !c.ok;
+    }
+    return fails;
+}
+
 int main()
 {
     auto always = [](float) { return true; };
@@ -171,7 +227,7 @@ int main()
         {"no pulse (must not lock)", 40, hr(0), Mode::RGB, 0.003f, 0.15f, always, never, 0.3f, 0, 0, 3, Scenario::NEVER},
         {"no pulse, noise x3", 40, hr(0), Mode::RGB, 0.003f, 0.45f, always, never, 0.3f, 0, 0, 3, Scenario::NEVER},
     };
-    int fails = 0, total = 0;
+    int fails = coherence_tests(), total = 2;
     for (auto &s : sc)
         for (unsigned seed : {1u, 2u, 3u, 4u, 5u}) {
             fails += run(s, seed);

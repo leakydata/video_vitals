@@ -133,6 +133,7 @@ Estimator::~Estimator()
 void Estimator::reset()
 {
     trk_.reset();
+    coh_miss_ = 0;
     std::memset(pulse_, 0, sizeof(pulse_));
 }
 
@@ -385,9 +386,19 @@ Result Estimator::update(const Sample *samples, int n, uint32_t now_ms)
         }
     r.coherence = pairs ? coh / pairs : 0;
     const float q_coh = pairs ? std::fmin(1.0f, std::fmax(0.0f, (r.coherence - 0.05f) / 0.25f)) : 0.5f;
-    // hysteresis: coherence is required to acquire a lock, not to keep one
+    // Coherence is required to acquire a lock, and the requirement is eased
+    // afterwards so that a few poor windows do not throw away a good reading.
+    // Eased must not mean abandoned, though: if nothing coherent has been seen
+    // for a while, what is being tracked is no longer known to be a pulse, and
+    // the reading has to earn that again. Without this a lock, once acquired,
+    // could be carried indefinitely by anything periodic enough -- which for an
+    // unattended monitor is the dangerous direction to fail in.
+    constexpr float COH_OK = 0.35f;    // coherence score that counts as evidence
+    constexpr int COH_GRACE = 10;      // windows (~10 s) a lock may go without it
+    coh_miss_ = q_coh >= COH_OK ? 0 : coh_miss_ + 1;
     const float q_keep = q_snr * (0.25f + 0.75f * r.stability);
-    r.quality = trk_.good_streak() >= 4 ? std::fmax(q_keep, q_keep * q_coh) : q_keep * q_coh;
+    const bool earned = trk_.good_streak() >= 4 && coh_miss_ < COH_GRACE;
+    r.quality = earned ? std::fmax(q_keep, q_keep * q_coh) : q_keep * q_coh;
     // an unresolved octave is not worth locking on: halve the confidence
     // An unresolved octave must not be reported confidently: cap the quality
     // below the lock threshold rather than merely halving it.
