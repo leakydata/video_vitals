@@ -380,13 +380,19 @@ Result Estimator::update(const MotionSample *s, int n, uint32_t now_ms)
     r.best = -1;
     for (int8_t &c : r.sel) c = -1;
     trk_.predict(now_ms);
-    if (n < 2 || rppg::ms_diff(s[n - 1].t_ms, s[0].t_ms) < (WINDOW_S - 3) * 1000 ||
-        rppg::ms_diff(now_ms, s[n - 1].t_ms) > rppg::STALE_MS) {
+    // Presence is answered before the window guard below, and independently of
+    // it. It needs only a few seconds of samples, whereas a rate needs thirty,
+    // and the first half minute -- after the camera starts, or after the subject
+    // comes back into view -- is exactly when a monitor most needs to be able to
+    // say whether anything is breathing. Stale samples are the one exception: a
+    // stalled camera knows nothing about now.
+    const bool fresh = n >= 2 && rppg::ms_diff(now_ms, s[n - 1].t_ms) <= rppg::STALE_MS;
+    if (fresh) check_presence(s, n, r);
+    if (!fresh || rppg::ms_diff(s[n - 1].t_ms, s[0].t_ms) < (WINDOW_S - 3) * 1000) {
         r.state = rppg::NO_SIGNAL;
         trk_.no_signal();
-        return r;  // no usable window: report nothing, not the last tracked value
+        return r;  // no usable window: report no *rate*, not the last tracked value
     }
-    check_presence(s, n, r);
     const float (*sos)[6] = band_ == Band::ADULT ? SOS_ADULT : SOS_INFANT;
     r.motion = mask(s, n, -1, wg_);
 

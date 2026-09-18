@@ -239,6 +239,56 @@ static int feed_tests()
     return fails;
 }
 
+// Presence is the monitor's real question: is anything breathing *now*. A rate
+// computed over thirty seconds cannot answer it, so this measures how long the
+// separate presence check takes to notice breathing starting and, more
+// importantly, stopping. The numbers it prints are the specification: they are
+// what "it would tell you" means in seconds.
+static int presence_tests()
+{
+    auto trial = [](float amp, float stop_at, float &t_seen, float &t_lost) {
+        static Buffer buf;
+        static Estimator est;
+        static MotionSample tmp[kCap];
+        buf.clear();
+        est.reset();
+        std::mt19937 rng(5);
+        std::normal_distribution<float> g(0, 0.01f);
+        t_seen = t_lost = -1;
+        float phase = 0;
+        for (float t = 0; t < stop_at + 40; t += 1 / 20.0f) {
+            MotionSample ms{};
+            ms.t_ms = uint32_t(t * 1000);
+            ms.valid = 0xFFFFFFFFFull;
+            const bool breathing = t < stop_at;
+            if (breathing) phase += 2 * float(M_PI) * (15.0f / 60) * (1 / 20.0f);
+            const float b = breathing ? amp * std::sin(phase) : 0.0f;
+            for (int ch = 0; ch < kChan; ch++) ms.d[ch] = g(rng);
+            ms.d[kBoxChan0] += b;               // the chest box carries it
+            ms.d[2 * 9] += b;
+            buf.push(ms);
+            const Result r = est.update(tmp, buf.copy(tmp), ms.t_ms);
+            if (r.present && t_seen < 0) t_seen = t;
+            if (t_seen >= 0 && t > stop_at && !r.present && t_lost < 0) t_lost = t - stop_at;
+        }
+    };
+    float seen_normal, lost_normal, seen_shallow, lost_shallow;
+    trial(0.5f, 60, seen_normal, lost_normal);        // an adult's chest
+    trial(0.12f, 60, seen_shallow, lost_shallow);     // shallow: an infant, or under a blanket
+    struct { const char *name; float v; bool ok; } checks[] = {
+        {"notices breathing within 10 s", seen_normal, seen_normal > 0 && seen_normal < 10.0f},
+        {"notices it stopping within 15 s", lost_normal, lost_normal > 0 && lost_normal < 15},
+        {"notices shallow breathing at all", seen_shallow, seen_shallow > 0},
+        {"notices shallow breathing stopping", lost_shallow, lost_shallow > 0 && lost_shallow < 15},
+    };
+    int fails = 0;
+    for (auto &c : checks) {
+        std::printf("  %-52s %5.1f s  %s\n", c.name, c.v, c.ok ? "PASS" : "FAIL");
+        fails += !c.ok;
+    }
+    return fails;
+}
+
 // The chest box is anchored to the face box, and the face detector's idea of
 // where the face is wobbles by a pixel or two between frames even when nobody
 // moves. Since the box profile is measured in box coordinates, that wobble
@@ -377,7 +427,7 @@ int main(int argc, char **argv)
             if (std::string(s.name).find(argv[2]) != std::string::npos) f.push_back(s);
         sc = f;
     }
-    int fails = feed_tests() + region_tests() + box_jitter_tests(), total = 10;
+    int fails = feed_tests() + region_tests() + box_jitter_tests() + presence_tests(), total = 14;
     for (auto &s : sc)
         for (int seed = 1; seed <= seeds; seed++) {
             fails += run(s, seed);
