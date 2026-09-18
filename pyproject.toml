@@ -1,0 +1,18 @@
+[project]
+name = "heart-cam"
+version = "0.1.0"
+description = "Contactless heart rate and breathing from a camera, measured on an ESP32-S3"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "opencv-python<5",
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "pyserial",
+    "h5py",
+]
+
+[tool.uv]
+# The viewer and the evaluation tools are scripts, not an installable package:
+# there is nothing to build, and asking uv to build one only fails.
+package = false

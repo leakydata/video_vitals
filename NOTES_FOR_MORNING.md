@@ -337,7 +337,7 @@ currently offer.
 The board is running headless right now, recording to `recordings/`, so the empty-room
 evidence keeps accumulating. For the window back:
 
-    .venv/bin/python heartcam.py --single --scale 1.75 --zoom
+    uv run heartcam.py --single --scale 1.75 --zoom
 
 Drag a box on the video to watch a region without a face; `c` clears it; `z` toggles the
 zoom; `q` quits.

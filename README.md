@@ -48,14 +48,21 @@ PC viewer is optional.
 - `data/` — public test videos (see `data/SOURCES.md`)
 - `firmware/heart_cam/` — first Arduino prototype (superseded)
 
+## Setup
+The Python side is managed with [uv](https://docs.astral.sh/uv/); `uv sync` creates the
+environment from `pyproject.toml` and `uv.lock`, and `uv run` uses it without activating
+anything.
+
+    uv sync
+
 ## Build & flash
     . ~/esp-idf/export.sh
     cd idf && idf.py build && idf.py -p /dev/ttyACM0 flash
 
 ## Run
-    .venv/bin/python heartcam.py                          # viewer
-    .venv/bin/python heartcam.py --record recordings/x.bin
-    .venv/bin/python heartcam.py --headless               # text only
+    uv run heartcam.py                          # viewer
+    uv run heartcam.py --record recordings/x.bin
+    uv run heartcam.py --headless               # text only
 
 The board also works on its own: the user LED blinks with the pulse when locked.
 Viewer keys: `q` quit, `m` magnification, `a` re-auto-expose, `r` rotate 180,
@@ -75,9 +82,9 @@ colour) and `M` (tile displacement) lines.
     g++ -O2 -std=c++17 -I../main replay.cpp ../main/rppg.cpp -o replay
 
     # real video with ground truth (device-equivalent 320x240 RGB565 @ 11 fps)
-    .venv/bin/python tools/video_to_samples.py data/ubfc_rppg_dataset2_subject1/vid_first27s_ffv1.mkv /tmp/u.txt
+    uv run tools/video_to_samples.py data/ubfc_rppg_dataset2_subject1/vid_first27s_ffv1.mkv /tmp/u.txt
     idf/test/replay /tmp/u.txt > /tmp/u.csv
-    .venv/bin/python tools/evaluate.py /tmp/u.csv ubfc data/ubfc_rppg_dataset2_subject1/ground_truth.txt
+    uv run tools/evaluate.py /tmp/u.csv ubfc data/ubfc_rppg_dataset2_subject1/ground_truth.txt
 
     # a live recording
     idf/test/replay recordings/x.bin
