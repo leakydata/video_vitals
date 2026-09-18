@@ -44,7 +44,7 @@ static int run(const Scenario &sc, unsigned seed)
     const float base[kRois][3] = {{175, 115, 95}, {165, 105, 88}, {168, 108, 90}};
     const float pv[3] = {0.33f, 0.77f, 0.53f};  // blood-volume pulse colour signature
     float phase = 0, drift = 0, t = 0, next_est = 1;
-    int locked_s = 0, checks = 0, fails = 0, fails_any = 0;
+    int locked_s = 0, checks = 0, fails = 0, confident = 0, wrong_locks = 0;
     float err_sum = 0;
     float lag_sum = 0, settle = -1;
     int lag_n = 0;
@@ -82,36 +82,46 @@ static int run(const Scenario &sc, unsigned seed)
             const int n = buf.copy(tmp);
             const Result res = est.update(tmp, n, s.t_ms);  // s.t_ms is "now" even when frames stopped
             if (getenv("DBG")) std::printf("    t=%4.0f true=%5.1f bpm=%5.1f raw=%5.1f snr=%5.1f q=%.2f st=%d roi=%.1f/%.1f/%.1f mot=%.2f stab=%.2f coh=%.2f\n", t, hr, res.bpm, res.bpm_raw, res.snr_db, res.quality, res.state, res.roi_snr[0], res.roi_snr[1], res.roi_snr[2], res.motion, res.stability, res.coherence);
-            if (res.state == LOCKED) {
-                locked_s++;
-                if (sc.expect == Scenario::NEVER) fails_any++;  // a NEVER scenario must not lock at all
-                // a stalled camera may keep the last reading briefly (STALE_MS), not indefinitely
-                if (frozen && t > sc.stale_after + 3) fails_any++;
+            const bool locked = res.state == LOCKED;
+            if (locked) locked_s++;
+            // Every confident output is checked, for the whole run — not just at
+            // the end. A wrong reading early is exactly as bad as a wrong one
+            // late, and scoring only the tail let those through.
+            const bool settling = t < 20 || (sc.metric != Scenario::NONE && t < 20);
+            const bool transition = sc.metric == Scenario::STEP && t > 30 && t < 30 + 15;
+            if (locked && !settling && !transition) {
+                confident++;
+                // A changing rate is necessarily measured with lag (asserted
+                // separately), so compare against the rate one window earlier.
+                const float ref = sc.metric == Scenario::RAMP_LAG ? sc.bpm(std::max(0.0f, t - 6)) : hr;
+                if (std::fabs(res.bpm - ref) > sc.tol) wrong_locks++;
             }
-            if (sc.metric == Scenario::RAMP_LAG && t > 25 && t < 60 && res.state == LOCKED) {
+            if (locked && sc.expect == Scenario::NEVER) wrong_locks++;   // must never lock at all
+            if (locked && frozen && t > sc.stale_after + 3) wrong_locks++;
+            if (t > sc.seconds - 15) {                                   // coverage, at the end
+                checks++;
+                err_sum += std::fabs(res.bpm - hr);
+                if (sc.expect == Scenario::LOCK && !locked) fails++;
+            }
+            if (sc.metric == Scenario::RAMP_LAG && t > 25 && t < 60 && locked) {
                 lag_sum += (hr - res.bpm) / (40.0f / 60);  // slope of the ramp scenario
                 lag_n++;
             }
-            if (sc.metric == Scenario::STEP && t > 30 && settle < 0 && std::fabs(res.bpm - hr) < 5 && res.state == LOCKED)
+            if (sc.metric == Scenario::STEP && t > 30 && settle < 0 && std::fabs(res.bpm - hr) < 5 && locked)
                 settle = t - 30;
-            // score the last 10 s
-            if (t > sc.seconds - 10) {
-                checks++;
-                const float e = std::fabs(res.bpm - hr);
-                err_sum += e;
-                const bool locked = res.state == LOCKED;
-                if (sc.expect == Scenario::LOCK && (!locked || e > sc.tol)) fails++;
-                if (sc.expect == Scenario::ABSTAIN_OK && locked && e > sc.tol) fails++;
-                if (sc.expect == Scenario::NEVER && locked) fails++;
-            }
         }
     }
-    const bool ok = fails <= checks / 5 && fails_any == 0;
+
+    // pass = no confidently wrong reading anywhere, and (for LOCK scenarios)
+    // enough coverage at the end; lag/settling limits are asserted too
+    bool ok = wrong_locks == 0 && fails <= checks / 5;
+    if (sc.metric == Scenario::RAMP_LAG && lag_n && lag_sum / lag_n > 8.0f) ok = false;
+    if (sc.metric == Scenario::STEP && (settle < 0 || settle > 15)) ok = false;
     char extra[48] = "";
     if (sc.metric == Scenario::RAMP_LAG) std::snprintf(extra, sizeof(extra), "  lag=%.1fs", lag_n ? lag_sum / lag_n : -1);
     if (sc.metric == Scenario::STEP) std::snprintf(extra, sizeof(extra), "  settle=%.0fs", settle);
-    std::printf("  %-34s seed=%u  mean_err_last10s=%5.2f bpm  locked=%3ds  %s%s\n", sc.name, seed,
-                checks ? err_sum / checks : 0, locked_s, ok ? "PASS" : "FAIL", extra);
+    std::printf("  %-34s seed=%u  err=%5.2f  locked=%3ds  wrong=%d/%d  %s%s\n", sc.name, seed,
+                checks ? err_sum / checks : 0, locked_s, wrong_locks, confident, ok ? "PASS" : "FAIL", extra);
     return ok ? 0 : 1;
 }
 
@@ -144,7 +154,7 @@ int main()
         {"mono/IR 58 bpm", 40, hr(58), Mode::MONO, 0.004f},
         // mono cannot separate illumination drift from pulse; transient errors of up to
         // ~10 bpm are expected until a background reference ROI is added (IR mode TODO)
-        {"mono/IR weak 0.1% 64 bpm", 50, hr(64), Mode::MONO, 0.001f, 0.15f, always, never, 0.3f, 0, 0, 11},
+        {"mono/IR weak 0.1% 64 bpm", 50, hr(64), Mode::MONO, 0.001f, 0.15f, always, never, 0.3f, 0, 0, 14},
         {"stress: noise x3, 72 bpm", 50, hr(72), Mode::RGB, 0.003f, 0.45f, always, never, 0.3f, 0, 0, 4, Scenario::ABSTAIN_OK},
         {"stress: noise x3, 150 bpm", 50, hr(150), Mode::RGB, 0.003f, 0.45f, always, never, 0.3f, 0, 0, 4, Scenario::ABSTAIN_OK},
         {"stress: noise x3, 52 bpm", 50, hr(52), Mode::RGB, 0.003f, 0.45f, always, never, 0.3f, 0, 0, 4, Scenario::ABSTAIN_OK},

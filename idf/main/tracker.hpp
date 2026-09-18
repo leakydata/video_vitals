@@ -62,6 +62,9 @@ inline float autocorr(const float *x, int n, float lag)
 #ifndef OCTAVE_MARGIN
 #define OCTAVE_MARGIN 0.20f    // how much better it must repeat in the waveform
 #endif
+#ifndef OCTAVE_WAVE_EPS
+#define OCTAVE_WAVE_EPS 0.10f  // half-period fitting the waveform better by this much is doubt
+#endif
 #ifndef OCTAVE_AMBIG
 #define OCTAVE_AMBIG 0.08f     // rival power (relative to the peak) that makes the octave doubtful
 #endif
@@ -82,11 +85,18 @@ inline Octave resolve_octave(const float *wave, int n, float fs, float rate, flo
     const float p0 = p_at(rate);
     Octave out{rate, false};
     const float half = rate / 2, dbl = rate * 2;
-    if (half >= lo && p_at(half) > OCTAVE_SUPPORT * p0) {
+    if (half >= lo) {
         const float rh = autocorr(wave, n, 60.0f * fs / half);
-        if (rh > r0 + OCTAVE_MARGIN) out.rate = half;
-        // a strong rival that the waveform cannot separate: report nothing confident
-        else if (p_at(half) > OCTAVE_AMBIG * p0) out.ambiguous = true;
+        if (p_at(half) > OCTAVE_SUPPORT * p0 && rh > r0 + OCTAVE_MARGIN) {
+            out.rate = half;   // the waveform clearly prefers the longer period
+        } else if (p_at(half) > OCTAVE_AMBIG * p0 ||
+                   (rh > r0 + OCTAVE_WAVE_EPS && p_at(half) > 0.02f * p0)) {
+            // Either a rival with real spectral support, or a half-period that
+            // explains the waveform better than the peak does. Not enough to
+            // overturn the peak, but enough that no confident rate may be
+            // reported: a dominant 2nd harmonic looks exactly like this.
+            out.ambiguous = true;
+        }
     }
     if (out.rate == rate && dbl <= hi && p_at(dbl) > p0) {
         const float rd = autocorr(wave, n, 60.0f * fs / dbl);
@@ -175,6 +185,10 @@ public:
             // prove itself over the full run.
             good_ += quality >= LOCK_STRONG ? 2 : 1;
             bad_ = 0;
+        } else if (accepted) {
+            // Accepted but not good enough to count: a lock may not live on
+            // indefinitely on evidence too weak to have earned it.
+            if (good_ > 0) good_--;
         } else if (!accepted) {
             bad_++;
             if (good_ > 0 && bad_ > 3) good_--;

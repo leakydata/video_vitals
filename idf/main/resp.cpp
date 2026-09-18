@@ -451,7 +451,9 @@ Result Estimator::update(const MotionSample *s, int n, uint32_t now_ms)
     // a lone channel gets no agreement credit
     const float q_agree = sel >= 2 ? r.agreement : 0.5f;
     r.quality = q_snr * (0.25f + 0.75f * r.stability) * (0.2f + 0.8f * q_agree);
-    if (oct.ambiguous) r.quality *= 0.5f;  // unresolved octave: not worth locking on
+    // An unresolved octave must not be reported confidently: cap the quality
+    // below the lock threshold rather than merely halving it.
+    if (oct.ambiguous) r.quality = std::fmin(r.quality * 0.5f, 0.45f);
 
     trk_.update(z, r.quality, r.motion < MOTION_MAX);
     r.state = trk_.locked() ? rppg::LOCKED : rppg::ACQUIRING;

@@ -11,6 +11,7 @@ usage: session_report.py recordings/x.bin [-o report.png] [--csv out.csv]
 """
 import argparse
 import csv
+import os
 import re
 import sys
 
@@ -25,14 +26,16 @@ STATE = {"no_signal": 0, "acquiring": 1, "locked": 2}
 
 def parse(path):
     hr, rr, pacer = [], [], []
-    t0 = None
+    # annotations live beside the recording: the recording itself is a byte-exact
+    # copy of the serial stream and nothing may be written into it
+    marks_path = path + ".marks.txt"
+    if os.path.exists(marks_path):
+        for line in open(marks_path):
+            m = re.match(r"([\d.]+)\s+pacer (on|off) rate=(\d+)", line)
+            if m:
+                pacer.append((float(m.group(1)), m.group(2) == "on", float(m.group(3))))
     for line in open(path, "rb").read().split(b"\n"):
         p = max(line.rfind(b"HR "), line.rfind(b"RR "))
-        if line.startswith(b"# viewer pacer"):
-            m = re.search(rb"pacer (on|off) rate=(\d+) t=([\d.]+)", line)
-            if m:
-                pacer.append((float(m.group(3)), m.group(1) == b"on", float(m.group(2))))
-            continue
         if p < 0:
             continue
         kind = line[p:p + 2]

@@ -107,6 +107,7 @@ void TileMotion::process_yuyv(const uint8_t *px, int w, int h, uint32_t t_ms, bo
     out.valid = 0;
     out.jump = 0;
     out.subject = 0;
+    for (float &d : out.d) d = 0;  // invalid channels must still be defined: they are serialised
     out.gross = external_motion;
     if (!have_ref_) {
         std::memcpy(ref_row_, cur_row_, sizeof(ref_row_));
@@ -216,9 +217,13 @@ void TileMotion::process_yuyv(const uint8_t *px, int w, int h, uint32_t t_ms, bo
 
     if (jumps >= GROSS_CHANNELS) out.gross = true;
     if (out.gross) {
-        // after a big movement the old references are meaningless
+        // After a big movement the old references are meaningless — including
+        // the face-anchored boxes, whose references were previously left in
+        // place while their offsets moved, counting their displacement twice.
         std::memcpy(ref_row_, cur_row_, sizeof(ref_row_));
         std::memcpy(ref_col_, cur_col_, sizeof(ref_col_));
+        std::memcpy(ref_brow_, cur_brow_, sizeof(ref_brow_));
+        std::memcpy(ref_bcol_, cur_bcol_, sizeof(ref_bcol_));
         for (int ch = 0; ch < kChan; ch++) off_[ch] = last_[ch];
     }
 }

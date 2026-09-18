@@ -65,8 +65,9 @@ class Device(threading.Thread):
         self.frames = deque(maxlen=4)
         self.samples = deque(maxlen=600)  # (t, [[r,g,b,n] x3], motion)
         self.hr = {}
-        self.hr_time = 0
+        self.hr_time = 0      # monotonic time the last HR line arrived
         self.rr = {}
+        self.rr_time = 0
         self.motion = deque(maxlen=600)  # (t, displacements[32], valid mask, gross)
         self.running = True
         self.rec = open(record, "wb") if record else None
@@ -111,15 +112,17 @@ class Device(threading.Thread):
 
     def _line(self, line):
         if line.startswith("HR "):
-            self.hr = dict(re.findall(r"(\w+)=([\w.\-]+)", line))
-            self.hr_time = time.time()
+            self.hr = dict(re.findall(r"(\w+)=(\S+)", line))
+            self.hr_time = time.monotonic()
         elif line.startswith("RR "):
-            self.rr = dict(re.findall(r"(\w+)=([\w.\-]+)", line))
+            self.rr = dict(re.findall(r"(\w+)=(\S+)", line))
+            self.rr_time = time.monotonic()
         elif line.startswith("M "):
             v = line.split()
-            if len(v) == 5 + N_CHAN:
+            # M t valid jump subject gross d0..d35
+            if len(v) == 6 + N_CHAN:
                 try:
-                    self.motion.append((int(v[1]) / 1000.0, np.array(v[5:], float), int(v[2]), int(v[4])))
+                    self.motion.append((int(v[1]) / 1000.0, np.array(v[6:], float), int(v[2]), int(v[5])))
                 except ValueError:
                     pass
         elif line.startswith("S "):
@@ -147,6 +150,10 @@ class Device(threading.Thread):
             except (serial.SerialException, OSError):
                 print("[viewer] board disconnected, waiting for it to come back...")
                 self.connected = False
+                # nothing measured before the disconnect describes now
+                self.hr, self.rr = {}, {}
+                self.samples.clear()
+                self.motion.clear()
                 try:
                     self.ser.close()
                 except Exception:
@@ -395,8 +402,9 @@ def main():
     last_print = 0
     view = None
     # AUTOSIZE, not NORMAL: some window managers fail to map the resizable one.
-    cv2.namedWindow(WINDOW, cv2.WINDOW_AUTOSIZE)
-    cv2.moveWindow(WINDOW, *args.pos)            # a desktop spanning several screens can place it off-view
+    if not args.headless:
+        cv2.namedWindow(WINDOW, cv2.WINDOW_AUTOSIZE)
+        cv2.moveWindow(WINDOW, *args.pos)        # a desktop spanning several screens can place it off-view
     zoom = False
     pacer_on, pacer_rate, pacer_t0 = args.pacer > 0, args.pacer or 10.0, time.time()
     if pacer_on:
@@ -472,6 +480,12 @@ def main():
             breath = breathing_wave(list(dev.motion), int(rr.get("best", -1)))
             draw_plot(panel, 5, 170, PW - 10, 62, breath, (255, 255, 0), "breathing (best region, last 30 s)")
 
+            # A reading older than a few seconds describes the past, not now.
+            STALE = 5.0
+            if time.monotonic() - dev.hr_time > STALE:
+                h = {}
+            if time.monotonic() - dev.rr_time > STALE:
+                rr = {}
             state = h.get("state", "")
             bpm = float(h.get("bpm", 0) or 0)
             col = {"locked": (80, 255, 80), "acquiring": (0, 200, 255)}.get(state, (120, 120, 120))

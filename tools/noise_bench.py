@@ -86,12 +86,25 @@ def main():
         print(f"frame rate        {max(fps):.1f} fps")
     if M:
         M = np.array(M)
-        d = M[:, 5:]                      # channel displacements (px)
+        d = M[:, 6:]                       # channel displacements (px)
+        valid = M[:, 1].astype(np.int64)   # bit per channel: tracked this frame
+        jump = M[:, 3].astype(np.int64)
         step = np.abs(np.diff(d, axis=0))
-        med = np.median(step, axis=0)
-        quiet = np.sort(med)[: len(med) // 2]   # the still half of the scene
-        print(f"tracker noise     {np.median(quiet):.4f} px per frame (quiet channels)"
-              f"   best {quiet.min():.4f}")
+        med, cover = [], []
+        for c in range(d.shape[1]):
+            # only consecutive frames where the channel was tracked and not
+            # flagged: an untracked channel reads as perfectly quiet otherwise
+            ok = np.array([bool((valid[i] >> c) & 1) and bool((valid[i + 1] >> c) & 1)
+                           and not ((jump[i] >> c) & 1) and not ((jump[i + 1] >> c) & 1)
+                           for i in range(len(d) - 1)])
+            cover.append(ok.mean())
+            med.append(np.median(step[ok, c]) if ok.sum() > 20 else np.nan)
+        med = np.array(med)
+        good = med[~np.isnan(med)]
+        quiet = np.sort(good)[: max(1, len(good) // 2)]
+        print(f"tracker noise     {np.median(quiet):.4f} px per frame (quietest half of "
+              f"{len(good)}/{d.shape[1]} tracked channels)   best {quiet.min():.4f}")
+        print(f"tracking coverage {100 * np.mean(cover):.0f}% of channel-frames")
     else:
         print("tracker noise     no motion samples (is the firmware current?)")
     if S:

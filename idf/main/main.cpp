@@ -28,6 +28,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <list>
 
 #include "driver/gpio.h"
@@ -365,7 +366,7 @@ static rppg::RoiSample roi_mean(const uint8_t *px, const Rect &r, bool any_colou
 
     // pass 2: average the pixels whose colour matches the box's own
     constexpr int TOL = 14;  // chroma distance still counted as the same surface
-    uint32_t sr = 0, sg = 0, sb = 0, n = 0, ar = 0, ag = 0, ab = 0;
+    uint32_t sr = 0, sg = 0, sb = 0, n = 0, ar = 0, ag = 0, ab = 0, un = 0;
     for (int y = r.y; y < r.y + r.h; y++) {
         const uint8_t *row = px + y * W * 2;
         for (int x = r.x; x < r.x + r.w; x++) {
@@ -378,17 +379,19 @@ static rppg::RoiSample roi_mean(const uint8_t *px, const Rect &r, bool any_colou
             const int G = std::clamp(Y - ((22554 * ce + 46802 * cd) >> 16), 0, 255);
             const int B = std::clamp(Y + ((116130 * ce) >> 16), 0, 255);
             if (R > 250 || G > 250 || B > 250) continue;  // clipped / specular
-            ar += R; ag += G; ab += B;
+            ar += R; ag += G; ab += B; un++;   // pixels actually in the fallback sums
             if (std::abs(Cb - mcb) > TOL || std::abs(Cr - mcr) > TOL) continue;
             sr += R; sg += G; sb += B; n++;
         }
     }
-    if (!any_colour && n >= an / 3 && n >= 16) {
+    if (!any_colour && n >= un / 3 && n >= 16) {
         out = {float(sr) / n, float(sg) / n, float(sb) / n, uint16_t(std::min<uint32_t>(n, 65535))};
-    } else if (an >= 16) {
+    } else if (un >= 16) {
         // mono/IR has no usable chroma, and a box whose colour is not uniform is
-        // better measured whole than not at all
-        out = {float(ar) / an, float(ag) / an, float(ab) / an, uint16_t(std::min<uint32_t>(an, 65535))};
+        // better measured whole than not at all. Divide by the pixels that are
+        // actually in these sums, not by the larger luminance-valid count:
+        // otherwise a changing clipped fraction looks like a brightness change.
+        out = {float(ar) / un, float(ag) / un, float(ab) / un, uint16_t(std::min<uint32_t>(un, 65535))};
     }
     return out;
 }
@@ -416,6 +419,9 @@ static void clear_history()
     g_rbuf->clear();
     xSemaphoreGive(buf_mtx);
     g_tiles->reset();
+    g_est->reset();
+    g_rest->reset();
+    break_history(esp_timer_get_time());  // and mark the frames either side as movement
 }
 
 static void cam_task(void *)
@@ -523,6 +529,16 @@ static void cam_task(void *)
                 s.roi[i] = m;
             }
             s.motion = s.motion || now < jump_until;
+            // No usable ROI at all (face lost, or the image clipped/black) must
+            // still be recoverable: fall back to the frame's own brightness,
+            // otherwise a large lighting change strands the device permanently.
+            if (!levels && (stats.brightness > 215 || stats.brightness < 25) &&
+                now - last_relock > 30000000 && !cfg.relock) {
+                ESP_LOGI(TAG, "frame brightness %d with no usable ROI: re-running auto exposure",
+                         stats.brightness);
+                cfg.relock = true;
+                last_relock = now;
+            }
             if (levels) {
                 const float lvl = level / levels;
                 stats.roi_level = stats.roi_level > 0 ? 0.98f * stats.roi_level + 0.02f * lvl : lvl;
@@ -561,10 +577,12 @@ static void cam_task(void *)
                 const float ox = fcx * win.w / W, oy = fcy * win.h / H;
                 const int sx = win.x + int(sen->status.hmirror ? win.w - 1 - ox : ox);
                 const int sy = win.y + int(sen->status.vflip ? win.h - 1 - oy : oy);
-                const int want_w = std::max<int>(4 * W, int(3.2f * fw * win.w / W));
-                const bool moved = std::abs(sx - (win.x + win.w / 2)) > win.w / 3 ||
-                                   std::abs(sy - (win.y + win.h / 2)) > win.h / 3 ||
-                                   std::abs(want_w - win.w) > win.w / 2;
+                // compare the window we would actually get (clamped), or a
+                // centred subject can never satisfy the size condition
+                const int want_w = std::clamp(int(3.2f * fw * win.w / W), 4 * W, ARR_W);
+                const bool moved = std::abs(sx - (win.x + win.w / 2)) > win.w / 6 ||
+                                   std::abs(sy - (win.y + win.h / 2)) > win.h / 6 ||
+                                   std::abs(want_w - win.w) > win.w / 5;
                 if (moved) {
                     apply_window(sx, sy, want_w);
                     break_history(now);
@@ -708,8 +726,9 @@ static void detect_task(void *)
             // 180 degrees on YUYV: reverse the order of the pixel pairs and swap
             // the two luminance samples within each (chroma stays with its pair)
             uint32_t *p32 = (uint32_t *)det_frame;
+            // [Y0,U,Y1,V] -> [Y1,U,Y0,V]: keep the chroma bytes, swap the luma
             auto swapY = [](uint32_t v) {
-                return (v & 0x00FF00FFu) | ((v >> 16) & 0x0000FF00u) | ((v & 0x0000FF00u) << 16);
+                return (v & 0xFF00FF00u) | ((v >> 16) & 0x000000FFu) | ((v & 0x000000FFu) << 16);
             };
             for (int i = 0, j = W * H / 2 - 1; i < j; i++, j--) {
                 const uint32_t a = p32[i], b = p32[j];
@@ -957,6 +976,21 @@ static void cmd_task(void *)
     }
 }
 
+// Blink the LED fast and say why, rather than running on in an unknown state.
+[[noreturn]] static void fatal(const char *why)
+{
+    ESP_LOGE(TAG, "fatal: %s", why);
+    gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
+    for (;;) {
+        gpio_set_level(LED_PIN, 0);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        gpio_set_level(LED_PIN, 1);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        ESP_LOGE(TAG, "fatal: %s", why);
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    }
+}
+
 extern "C" void app_main(void)
 {
     out_mtx = xSemaphoreCreateMutex();
@@ -975,28 +1009,31 @@ extern "C" void app_main(void)
     gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
     gpio_set_level(LED_PIN, 1);
 
-    g_buf = new rppg::Buffer();
-    g_est = new rppg::Estimator();
-    g_rbuf = new resp::Buffer();
-    g_rest = new resp::Estimator();
-    g_tiles = new resp::TileMotion();
+    g_buf = new (std::nothrow) rppg::Buffer();
+    g_est = new (std::nothrow) rppg::Estimator();
+    g_rbuf = new (std::nothrow) resp::Buffer();
+    g_rest = new (std::nothrow) resp::Estimator();
+    g_tiles = new (std::nothrow) resp::TileMotion();
     det_frame = (uint8_t *)heap_caps_malloc(W * H * 2, MALLOC_CAP_SPIRAM);
     str_frame = (uint8_t *)heap_caps_malloc(W * H * 2, MALLOC_CAP_SPIRAM);
+    if (!g_buf || !g_est || !g_rbuf || !g_rest || !g_tiles || !det_frame || !str_frame || !out_mtx ||
+        !face_mtx || !buf_mtx || !stats.mtx || !det_sem || !str_sem) {
+        fatal("out of memory during start-up");
+    }
 
     ESP_LOGI(TAG, "booting");
-    if (!camera_init()) {
-        for (;;) {
-            gpio_set_level(LED_PIN, !gpio_get_level(LED_PIN));
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-    }
+    if (!camera_init()) fatal("camera did not initialise");
     auto_then_lock(2500);
 
-    xTaskCreatePinnedToCore(cam_task, "cam", 6144, nullptr, 6, nullptr, 1);
-    xTaskCreatePinnedToCore(detect_task, "detect", 16384, nullptr, 4, nullptr, 0);
-    xTaskCreatePinnedToCore(hr_task, "hr", 24576, nullptr, 5, nullptr, 1);
-    xTaskCreatePinnedToCore(stream_task, "stream", 8192, nullptr, 3, nullptr, 0);
-    xTaskCreatePinnedToCore(led_task, "led", 2048, nullptr, 2, nullptr, 1);
-    xTaskCreatePinnedToCore(cmd_task, "cmd", 4096, nullptr, 5, nullptr, 0);
+    // A task that failed to start would leave the device quietly half-working,
+    // which is worse than not starting at all.
+    struct { TaskFunction_t fn; const char *name; int stack, prio, core; } tasks[] = {
+        {cam_task, "cam", 6144, 6, 1},   {detect_task, "detect", 16384, 4, 0},
+        {hr_task, "hr", 24576, 5, 1},    {stream_task, "stream", 8192, 3, 0},
+        {led_task, "led", 2048, 2, 1},   {cmd_task, "cmd", 4096, 5, 0},
+    };
+    for (const auto &t : tasks)
+        if (xTaskCreatePinnedToCore(t.fn, t.name, t.stack, nullptr, t.prio, nullptr, t.core) != pdPASS)
+            fatal("could not start a task");
     ESP_LOGI(TAG, "ready");
 }

@@ -96,7 +96,7 @@ class Reader(threading.Thread):
         super().__init__(daemon=True)
         self.port, self.kind = port, kind
         self.br = self.hr = None      # latest rates
-        self.t = 0
+        self.br_t = self.hr_t = 0.0   # when each was last updated (monotonic)
         self.running = True
 
     def run(self):
@@ -120,10 +120,10 @@ class Reader(threading.Thread):
                 for ftype, p in fp.feed(data):
                     if ftype == T_BREATH and len(p) >= 4:
                         self.br = struct.unpack("<f", p[:4])[0]
-                        self.t = time.time()
+                        self.br_t = time.monotonic()
                     elif ftype == T_HEART and len(p) >= 4:
                         self.hr = struct.unpack("<f", p[:4])[0]
-                        self.t = time.time()
+                        self.hr_t = time.monotonic()
             else:
                 buf += data
                 lines = buf.split(b"\n")
@@ -137,10 +137,12 @@ class Reader(threading.Thread):
                     state = kv.get(b"state", b"").decode()
                     if ln.startswith(b"HR"):
                         self.hr = val if state == "locked" else None
+                        self.hr_t = time.monotonic()
                     else:
                         self.br = val if state == "locked" else None
-                    self.t = time.time()
+                        self.br_t = time.monotonic()
         ser.close()
+        self.br = self.hr = None   # a reader that has stopped has nothing current to say
 
 
 def main():
@@ -173,7 +175,13 @@ def main():
         while time.time() - t0 < a.seconds:
             time.sleep(1.0)
             t = time.time() - t0
-            rb, rh, cb, ch = radar.br, radar.hr, cam.br, cam.hr
+            # Only pair readings that are both current: a stopped device would
+            # otherwise keep contributing its last value to the agreement score.
+            FRESH = 5.0
+            now = time.monotonic()
+            fresh = lambda v, t: v if (v is not None and now - t < FRESH) else None
+            rb, rh = fresh(radar.br, radar.br_t), fresh(radar.hr, radar.hr_t)
+            cb, ch = fresh(cam.br, cam.br_t), fresh(cam.hr, cam.hr_t)
             if out:
                 out.write(f"{t:.1f},{rb or ''},{rh or ''},{cb or ''},{ch or ''}\n")
                 out.flush()

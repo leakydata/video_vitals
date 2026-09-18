@@ -389,7 +389,9 @@ Result Estimator::update(const Sample *samples, int n, uint32_t now_ms)
     const float q_keep = q_snr * (0.25f + 0.75f * r.stability);
     r.quality = trk_.good_streak() >= 4 ? std::fmax(q_keep, q_keep * q_coh) : q_keep * q_coh;
     // an unresolved octave is not worth locking on: halve the confidence
-    if (oct.ambiguous) r.quality *= 0.5f;
+    // An unresolved octave must not be reported confidently: cap the quality
+    // below the lock threshold rather than merely halving it.
+    if (oct.ambiguous) r.quality = std::fmin(r.quality * 0.5f, 0.45f);
 
     trk_.update(z, r.quality, r.motion < MOTION_MAX);
     r.state = trk_.locked() ? LOCKED : ACQUIRING;

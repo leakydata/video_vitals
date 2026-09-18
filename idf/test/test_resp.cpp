@@ -87,7 +87,7 @@ static int run(const Scenario &sc, unsigned seed)
     std::vector<uint8_t> frame(W * H * 2);
 
     float t = 0, phase = 0, jump_x = 0, jump_y = 0, next = 1;
-    int checks = 0, fails = 0, locked = 0;
+    int checks = 0, fails = 0, locked = 0, confident = 0, wrong = 0;
     float err = 0;
     while (t < sc.seconds) {
         const float dt = 0.09f + 0.01f * u(rng);
@@ -134,20 +134,28 @@ static int run(const Scenario &sc, unsigned seed)
                 std::printf("    t=%5.1f true=%5.1f br=%5.1f raw=%5.1f snr=%5.1f q=%.2f stab=%.2f agr=%.2f st=%d ch=%d best=%d mot=%.2f\n",
                             t, br, r.brpm, r.raw, r.snr_db, r.quality, r.stability, r.agreement, r.state,
                             r.channels, r.best, r.motion);
-            if (r.state == rppg::LOCKED) locked++;
+            const bool lk = r.state == rppg::LOCKED;
+            if (lk) locked++;
+            // every confident output is checked, for the whole run
+            // A 30 s window cannot follow a rate change instantly, so a window
+            // spanning a change is not scored for accuracy (the change itself is
+            // covered by the end-of-run coverage check).
+            const bool spans_change = std::fabs(sc.rate(t) - sc.rate(std::max(0.0f, t - 30))) > 0.1f;
+            if (lk && t > 40 && !spans_change) {
+                confident++;
+                if (std::fabs(r.brpm - br) > sc.tol) wrong++;
+            }
+            if (lk && sc.expect == Scenario::NEVER) wrong++;
             if (t > sc.seconds - 15) {
                 checks++;
-                const bool lk = r.state == rppg::LOCKED;
-                const float e = std::fabs(r.brpm - br);
-                err += e;
-                if (sc.expect == Scenario::LOCK && (!lk || e > sc.tol)) fails++;
-                if (sc.expect == Scenario::NEVER && lk) fails++;
+                err += std::fabs(r.brpm - br);
+                if (sc.expect == Scenario::LOCK && !lk) fails++;
             }
         }
     }
-    const bool ok = fails <= checks / 5;
-    std::printf("  %-36s seed=%u  mean_err_last15s=%5.2f  locked=%3ds  %s\n", sc.name, seed, err / checks, locked,
-                ok ? "PASS" : "FAIL");
+    const bool ok = wrong == 0 && fails <= checks / 5;
+    std::printf("  %-36s seed=%u  err=%5.2f  locked=%3ds  wrong=%d/%d  %s\n", sc.name, seed, err / checks, locked,
+                wrong, confident, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -198,6 +206,7 @@ static int feed_tests()
         float t = 0, next = 1;
         int locked = 0, checks = 0;
         float err = 0;
+        bool hard_fail = false;
         while (t < 80) {
             t += 1 / c.fps;
             MotionSample ms{};
@@ -218,11 +227,12 @@ static int feed_tests()
                     checks++;
                     // locks before a stall are legitimate; only a stale lock counts
                     if (!c.expect_lock && lk && (c.stale_after == 0 || t > c.stale_after + 3)) err += 1;
+                    if (!c.expect_lock && lk && c.stale_after == 0) hard_fail = true;  // must never lock
                     if (c.expect_lock && (!lk || std::fabs(r.brpm - c.rate) > 1.5f)) err += 1;
                 }
             }
         }
-        const bool ok = err <= checks / 10;
+        const bool ok = err <= checks / 10 && !hard_fail;
         std::printf("  %-36s locked=%3ds  bad=%2.0f/%d  %s\n", c.name, locked, err, checks, ok ? "PASS" : "FAIL");
         fails += !ok;
     }

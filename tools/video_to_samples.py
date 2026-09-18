@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Turn a face video into the per-frame ROI samples the firmware produces.
 
-Mimics the device: frames are scaled to 320x240 and quantised to RGB565,
+Mimics the device: frames are scaled to 320x240 and put through the same
+YUV422 capture and integer colour reconstruction,
 landmarks come from a face detector running at ~3 Hz with the same smoothing,
 ROI placement, dead-band, skin gate and motion flag as main.cpp. Output is
 "S t_ms r g b n r g b n r g b n motion" lines, readable by test/replay.
@@ -22,11 +23,21 @@ FACE_MOTION = 0.35
 MODEL = os.path.join(os.path.dirname(__file__), "models", "yunet.onnx")
 
 
-def rgb565(frame_bgr):
-    """Quantise like the sensor: 5/6/5 bits, then expand as the firmware does."""
-    b = (frame_bgr[..., 0] >> 3).astype(np.int32) << 3
-    g = (frame_bgr[..., 1] >> 2).astype(np.int32) << 2
-    r = (frame_bgr[..., 2] >> 3).astype(np.int32) << 3
+def yuyv_rgb(frame_bgr):
+    """Reproduce the device's capture: YUV422 (chroma shared by each pixel pair),
+    then the firmware's integer YUV->RGB reconstruction. Matching this matters —
+    measuring the pulse from differently quantised pixels would make a replay
+    result say nothing about the firmware."""
+    yuv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YUV).astype(np.int32)
+    Y = yuv[..., 0]
+    Cb = yuv[..., 1].copy()
+    Cr = yuv[..., 2].copy()
+    Cb[:, 1::2] = Cb[:, 0::2]        # chroma is sampled once per pair
+    Cr[:, 1::2] = Cr[:, 0::2]
+    d, e = Cr - 128, Cb - 128
+    r = np.clip(Y + ((91881 * d) >> 16), 0, 255)
+    g = np.clip(Y - ((22554 * e + 46802 * d) >> 16), 0, 255)
+    b = np.clip(Y + ((116130 * e) >> 16), 0, 255)
     return r, g, b
 
 
@@ -135,7 +146,7 @@ def main():
                 continue
             next_keep = (next_keep if args.target_fps else 0) + (1 / args.target_fps if args.target_fps else 0)
             small = cv2.resize(frame, (W, H), interpolation=cv2.INTER_AREA)
-            r, g, b = rgb565(small)
+            r, g, b = yuyv_rgb(small)
 
             kept += 1
             if (kept - 1) % det_every == 0:
