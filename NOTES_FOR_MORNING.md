@@ -315,7 +315,9 @@ a trade worth making for a gain inside the noise of four clips, so it is on the 
 It deserves another look with footage that is actually overhead and supine — the geometry
 the idea is for, and which only one of these four clips resembles.
 
-## Two things need you
+## The two decisions that are yours
+
+(The two recordings I need are in the list at the top.)
 
 **1. Codex never ran.** Five attempts, all rejected before it read a line of code:
 `gpt-6-astra` needs a newer Codex than the plugin's bundled one (I upgraded the global CLI
@@ -323,12 +325,22 @@ to 0.155.0; it made no difference, so the plugin ships its own), and `gpt-5.3-co
 and `gpt-5-codex` are both refused for a ChatGPT-tier account. The path that *did* work
 earlier — running `codex exec` directly in a shell — is now blocked for me by Claude
 Code's permission classifier, which is your decision to make, not mine: a Bash permission
-rule for `codex` would unblock it. The review prompt is written and ready at
-`scratchpad/review3_prompt.txt`.
+rule for `codex` would unblock it. The review prompt is written and ready, and is in the repo at
+`docs/codex_review_prompt.txt` so it outlives the session.
 
 **2. The presence alarm policy**, once there is daylight data: how fast must it notice
 breathing stopping, and what should it do then. The 7.1 s figure above is what it can
 currently offer.
+
+## Starting it up again
+
+The board is running headless right now, recording to `recordings/`, so the empty-room
+evidence keeps accumulating. For the window back:
+
+    .venv/bin/python heartcam.py --single --scale 1.75 --zoom
+
+Drag a box on the video to watch a region without a face; `c` clears it; `z` toggles the
+zoom; `q` quits.
 
 ## Waiting on hardware
 

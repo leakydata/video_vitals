@@ -1,0 +1,46 @@
+You are reviewing heart_cam, an ESP32-S3 firmware that measures heart rate (rPPG, POS
+algorithm) and breathing rate (1-D Lucas-Kanade on luminance profiles) from a camera,
+plus a Python viewer. It is aimed at becoming a contactless baby/sleep monitor, so a
+WRONG READING IS WORSE THAN NO READING. Two previous reviews have been done and their
+fixes have landed; this is the third pass.
+
+Read the code yourself. Key files: idf/main/main.cpp (tasks, camera, zoom, ROIs),
+idf/main/rppg.cpp/hpp (heart rate), idf/main/resp.cpp/hpp (breathing + new presence
+detection), idf/main/motion.cpp/hpp (tile tracker), idf/main/tracker.hpp (shared Kalman,
+octave resolution), idf/main/evm.cpp/hpp (Eulerian magnification, off by default),
+heartcam.py (viewer), idf/test/*.cpp (host tests), tools/*.py. NOTES_FOR_MORNING.md
+records what the previous two reviews found and what was done about each.
+
+Focus, in priority order:
+
+1. NEW CODE SINCE THE LAST REVIEW, reviewed hardest:
+   - resp.cpp check_presence(): breathing PRESENCE (is anything breathing right now),
+     deliberately separate from rate. Is the floor estimate (quietest quartile of recent
+     swing) sound? What is its actual detection latency when breathing STOPS? What
+     false-negative modes does it have (shallow infant breathing, a very still subject, a
+     subject under a blanket)? What false-positive modes (a fan, a moving curtain, sensor
+     noise in the dark)?
+   - main.cpp task heartbeats plus a 20 s watchdog restart, and camera reinitialisation
+     after repeated capture failure. Can the watchdog fire spuriously? Can it fail to fire
+     when a task is alive but wedged? Does esp_restart() lose anything that matters?
+   - main.cpp auto-zoom framing: the sensor window is sized from face height so that the
+     head and the chest box both fit. Can it oscillate, get stuck, or crop the subject out
+     in any geometry?
+
+2. THE REMAINING OPEN ITEMS from the previous review, for which concrete, minimal
+   implementations are wanted rather than more description:
+   - fusion agreement overstates independence (overlapping tiles/boxes/axes counted as
+     independent evidence)
+   - anti-alias filtering costs infant-band sensitivity (about -8 dB at 1.3 Hz / 78 per
+     minute)
+   - box tracking can measure detector jitter rather than real motion
+   - cross-task configuration handoff race (settings written from the command task while
+     the camera task may be mid-sequence)
+   - coherence is not re-checked after acquisition
+
+3. ANYTHING THAT COULD MAKE THE DEVICE REPORT A CONFIDENT WRONG NUMBER, anywhere. That is
+   the most important failure mode.
+
+For each finding give: file:line, why it is wrong, the concrete failure scenario, and the
+smallest correct fix. Rank by severity. Be specific and adversarial; do not praise the
+code. If you believe a previous fix was wrong or incomplete, say so plainly.
