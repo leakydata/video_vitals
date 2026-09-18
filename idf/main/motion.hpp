@@ -17,8 +17,11 @@ constexpr int kTiles = GRID_X * GRID_Y;
 // box. Box 0 is the chest (under the face), box 1 the head: breathing moves
 // the chest most, but head motion carries it too when the chest is hidden.
 constexpr int kBoxes = 2;
-constexpr int kChan = 2 * kTiles + 2 * kBoxes;
+// ... plus one *expansion* channel per box: a chest seen from above expands
+// rather than shifts, and a shift-only measurement cannot see that at all.
 constexpr int kBoxChan0 = 2 * kTiles;   // channel of box 0, vertical (then horizontal)
+constexpr int kExpChan0 = 2 * kTiles + 2 * kBoxes;  // expansion channel of box 0
+constexpr int kChan = kExpChan0 + kBoxes;
 constexpr int kMaxProf = 64;       // max profile length
 constexpr int kBoxProf = 48;       // profile bins across a box (whatever its size)
 
@@ -47,7 +50,12 @@ public:
     // `boxes` are the face-anchored boxes (chest, head); pass invalid Boxes for none.
     void process_yuyv(const uint8_t *px, int w, int h, uint32_t t_ms, bool external_motion,
                           const Box boxes[kBoxes], MotionSample &out);
-    void reset() { have_ref_ = false; for (bool &b : have_box_) b = false; }
+    void reset()
+    {
+        have_ref_ = false;
+        for (bool &b : have_box_) b = false;
+        for (bool &b : have_exp_) b = false;
+    }
 
 private:
     void profiles(const uint8_t *px, int w, int h);
@@ -61,6 +69,10 @@ private:
     float last_[kChan] = {};   // previous displacement (for gross motion)
     float cur_brow_[kBoxes][kBoxProf], cur_bcol_[kBoxes][kBoxProf];
     float ref_brow_[kBoxes][kBoxProf], ref_bcol_[kBoxes][kBoxProf];
+    // The expansion fit keeps its own references: the shift fit re-keys whenever
+    // a box drifts a bin, and that would step the expansion baseline every time.
+    float ref_erow_[kBoxes][kBoxProf], ref_ecol_[kBoxes][kBoxProf];
+    bool have_exp_[kBoxes] = {};
     Box box_ref_[kBoxes] = {};   // the box each reference profile belongs to
     // Where the box sat when each box channel's reference profile was taken.
     // The profile is measured in box coordinates, so moving the box shifts the

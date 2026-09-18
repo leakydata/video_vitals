@@ -505,8 +505,9 @@ Result Estimator::update(const MotionSample *s, int n, uint32_t now_ms)
     const uint64_t subject = s[n - 1].subject;
     auto rank = [&](int ch) {
         float r = snr[ch];
-        if (ch >= kBoxChan0 + 2) r += HEAD_BONUS_DB;      // head box
-        else if (ch >= kBoxChan0) r += CHEST_BONUS_DB;    // chest box
+        if (ch >= kExpChan0) r -= 6.0f;   // expansion: derived and noisier, must be clearly better
+        else if (ch >= kBoxChan0 + 2) r += HEAD_BONUS_DB;  // head box
+        else if (ch >= kBoxChan0) r += CHEST_BONUS_DB;     // chest box
         if (subject && !(subject & (1ull << ch))) r -= OFF_SUBJECT_DB;
         return r;
     };
@@ -602,7 +603,10 @@ Result Estimator::update(const MotionSample *s, int n, uint32_t now_ms)
     int root[MAX_FUSED];
     for (int i = 0; i < sel; i++) {
         const int ch = order[i];
-        area[i] = ch < kBoxChan0 ? uint16_t(1u << (ch / 2)) : bt[(ch - kBoxChan0) / 2];
+        // an expansion channel watches the same patch as its box's shift channels
+        area[i] = ch >= kExpChan0  ? bt[ch - kExpChan0]
+                  : ch < kBoxChan0 ? uint16_t(1u << (ch / 2))
+                                   : bt[(ch - kBoxChan0) / 2];
         root[i] = i;
     }
     auto find = [&](int i) { while (root[i] != i) i = root[i] = root[root[i]]; return i; };
