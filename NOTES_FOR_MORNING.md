@@ -12,7 +12,7 @@ all from the same code rather than accumulated across the night.
 | | |
 |---|---|
 | Heart-rate suite | **107/107** (5 seeds) |
-| Breathing suite | **79/79** (5 seeds) |
+| Breathing suite | **80/80** (5 seeds) |
 | Heart rate on UBFC | **1.97 bpm MAE, 94% locked**, 100% within 5 bpm |
 | Infant clips (AIR-400) | **0 confidently wrong windows** (was 93 of 93) |
 | Empty room, all night | **9,192 windows, 0 false readings of either kind** |
@@ -212,6 +212,31 @@ risks bringing back false readings — and I cannot validate it safely, because 
 empty-room data I have is dark, where the tracker is unreliable for other reasons. It
 needs the lit empty-room recording. I am not loosening a safety threshold on evidence I
 do not have.
+
+## I reviewed my own night's work, and found two of my own bugs
+
+Reading the whole diff back as a reviewer rather than as the author turned up two defects
+I had introduced during the night. Both are fixed, both now have regression tests, and
+both tests fail on the code as it was.
+
+**A box sliding further than the fit can measure reported movement that never happened.**
+When I made the chest box tolerate sliding rather than re-keying, I widened the dead band
+to an eighth of the box. But the correction is a *shift*, and the fit can only measure
+about three bins of shift — past that it saturates and reports whatever is left over. On a
+completely frozen scene a box sliding 12 px produced **5.75 px of false displacement**:
+the exact failure the correction was written to remove, moved from one place to another.
+The dead band is now tied to what the fit can actually see. Same test: 0.00 px.
+
+**A subject against the edge of the sensor could make the zoom thrash.** A clipped face
+re-aims after three seconds instead of twenty, which is right when re-aiming can help. If
+you are at the edge of the *sensor*, the crop cannot move further, the face stays clipped
+whatever it does, and it would have re-aimed every three seconds indefinitely — a second
+of lost signal each time. It now backs off after three attempts.
+
+One observation while I was in there, not a bug and not new: the breathing estimator takes
+about **280 ms per update** when the channels are live — roughly a third of a core, once a
+second. Tonight's changes did not add to it (measured on identical input: 1.19 s before,
+1.17 s after), but it is the number that will limit anything more ambitious later.
 
 ## One idea I tried, measured, and threw away
 
