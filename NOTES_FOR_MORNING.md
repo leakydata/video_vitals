@@ -146,3 +146,56 @@ room. Happy to run that any time.
   baby-monitor idea, and I can't run it while you're in the chair.
 - OV5640 arriving Saturday: `tools/noise_bench.py` will compare it in five minutes.
 - EMAY monitor: passive breathing reference, no paced breathing needed.
+
+---
+
+# Addendum — late 18 September
+
+## Zoom was cutting your face off again
+
+Two causes, both fixed and **measured** rather than eyeballed:
+
+1. **It aimed from a stale face.** After the sensor window moves, the last known face
+   position describes the *old* view, so the next aim was computed in the wrong frame of
+   reference and walked the crop off you. The face is now invalidated whenever the window
+   moves, and only a detection less than 0.7 s old may aim the crop.
+2. **The crop was sized by a fixed multiple of face width** with a downward bias for the
+   chest. A turned head has a narrow box, so the crop tightened just when it shouldn't.
+   It is now sized from what actually has to fit: 0.40 face-heights of headroom above the
+   detector's box (which stops at your hairline), the face, and 1.05 below for the chest.
+   Face *height* drives it, which barely changes when you turn your head.
+
+Also: a face touching the frame edge now re-aims after 3 s instead of waiting out the 20 s
+rate limit, and widens 15% while doing it. Previously a slightly-off crop stayed wrong for
+twenty seconds.
+
+**Measured over 85 frames with you in the chair:** face box fully inside the frame in
+every frame, headroom 0.40 face-heights (24 px at worst), chest box in view throughout.
+Before the fix the same check showed the head against the edge.
+
+The chest box is still trimmed at the bottom edge by roughly a fifth. That is deliberate —
+the estimator accepts a partial chest box, and nothing tolerates half a face.
+
+## Also done tonight
+
+- **Camera recovery and task watchdogs** (was open item 3). Each of the camera, detector
+  and heart-rate tasks stamps a heartbeat; if any stops for 20 s the device restarts
+  itself. Capture failures reinitialise the camera every 20 failures and stop the device
+  after 200. This is what was missing before anything ran unattended all night.
+- **Breathing presence** (was open item 1, the one I said needed a decision from you).
+  A first cut: each region's recent 8 s swing is compared against the quietest quartile's
+  floor, and the RR line now says `breathing=seen|none xN quiet=Ns`. This answers "is
+  something moving like breathing right now", separately from the rate. It does **not**
+  yet have a measured detection latency or an alarm policy — that is still your call:
+  how fast must it notice, and what should it do then.
+- `heartcam.py --zoom` starts with the zoom on, so a viewer restart no longer loses it.
+
+Tests: heart rate **105/105**, breathing **41/41**.
+
+## Still open from the review
+
+2. Fusion agreement overstates independence (overlapping regions counted separately).
+4. Anti-aliasing costs infant-band sensitivity (≈ −8 dB at 1.3 Hz).
+5. Box tracking can measure detector jitter.
+6. Cross-task configuration handoff is a real race, no misbehaviour seen.
+7. Coherence is not re-checked after acquisition.

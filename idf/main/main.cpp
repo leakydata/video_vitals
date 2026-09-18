@@ -53,6 +53,8 @@
 
 static const char *TAG = "heart_cam";
 
+[[noreturn]] static void fatal(const char *why);   // blink fast and say why, rather than run on
+
 // ---------------------------------------------------------------- pins
 static constexpr int CAM_XCLK = 10, CAM_SIOD = 40, CAM_SIOC = 39;
 static constexpr int CAM_D[8] = {15, 17, 18, 16, 14, 12, 11, 48};
@@ -142,11 +144,20 @@ static struct {
     bool flipped = false;
 } cfg;
 
+// Each long-running task stamps its heartbeat; the LED task (which does almost
+// nothing else) restarts the device if one stops. An unattended monitor that has
+// quietly stopped measuring is worse than one that reboots and carries on.
+enum Beat { BEAT_CAM, BEAT_DET, BEAT_HR, BEAT_N };
+static std::atomic<int64_t> beats[BEAT_N];
+static constexpr int64_t BEAT_TIMEOUT_US = 20000000;
+static inline void beat(Beat b) { beats[b].store(esp_timer_get_time(), std::memory_order_relaxed); }
+
 static struct {
     float cam_fps = 0, det_fps = 0, det_ms = 0, det_hit = 0;
     int brightness = 0;  // mean luminance of the frame centre
     float roi_level = 0; // mean of the brightest channel of the skin ROIs
     float evm_ms = 0;    // time spent magnifying the preview
+    float jpeg_ms = 0, tx_ms = 0, jpeg_kb = 0;  // preview encode, transfer, size
     float roi_clip = 0;  // fraction of ROI pixels at or near saturation
     rppg::Result res{};
     resp::Result rr{};
@@ -440,6 +451,7 @@ static void cam_task(void *)
     rppg::RoiSample prev[rppg::kRois] = {};
     int64_t jump_until = 0;
     int64_t last_relock = 0;
+    int capture_fails = 0;
 
     for (;;) {
         if (cfg.relock) {
@@ -463,7 +475,25 @@ static void cam_task(void *)
             clear_history();
         }
         camera_fb_t *fb = esp_camera_fb_get();
-        if (!fb) continue;
+        if (!fb) {
+            // Capture can fail transiently; if it keeps failing the camera needs
+            // restarting, and if that does not work there is nothing to measure.
+            if (++capture_fails % 20 == 0) {
+                ESP_LOGW(TAG, "%d capture failures: restarting the camera", capture_fails);
+                esp_camera_deinit();
+                vTaskDelay(pdMS_TO_TICKS(200));
+                if (!camera_init()) ESP_LOGE(TAG, "camera restart failed");
+                else {
+                    apply_flip();
+                    auto_then_lock(1500);
+                }
+            }
+            if (capture_fails > 200) fatal("camera will not produce frames");
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        capture_fails = 0;
+        beat(BEAT_CAM);
         const uint32_t t_ms = fb->timestamp.tv_sec * 1000ULL + fb->timestamp.tv_usec / 1000;
         {
             // mean luminance of the frame centre: tells us whether a comparison
@@ -569,10 +599,31 @@ static void cam_task(void *)
         // because every window change discards the measurement history.
         if (cfg.zoom) {
             static int64_t last_zoom = 0;
-            if (face_ok && now - last_zoom > 20000000) {  // re-aiming costs ~1 s of signal
+            // Only ever aim from a *fresh* detection: after the window moves, the
+            // last known face position refers to the old view, and aiming from it
+            // walks the crop off the subject.
+            const bool face_fresh = f.valid && now - f.t_us < 700000;
+            // A face against the edge of the frame is being cut off, and the
+            // parts that are missing are the ones the measurement needs. That is
+            // worth a second of lost signal straight away rather than waiting out
+            // the ordinary rate limit.
+            const float EDGE = 0.06f;
+            const bool clipped = face_fresh &&
+                                 (f.box[0] < EDGE * W || f.box[2] > (1 - EDGE) * W ||
+                                  f.box[1] < EDGE * H || f.box[3] > (1 - EDGE) * H);
+            const int64_t wait = clipped ? 3000000 : 20000000;
+            if (face_fresh && now - last_zoom > wait) {  // re-aiming costs ~1 s of signal
                 const float fw = f.box[2] - f.box[0], fh = f.box[3] - f.box[1];
                 const float fcx = (f.box[0] + f.box[2]) / 2;
-                const float fcy = (f.box[1] + f.box[3]) / 2 + 0.6f * fh;  // bias down, to include the chest
+                // Frame what has to be in shot rather than a fixed multiple of
+                // the face: the detector's box stops at the hairline, so leave
+                // HEAD above it, and the chest box (0.15 fh below the face,
+                // 1.2 fh tall) needs CHEST below. Sized from the face *height*,
+                // which barely changes when the head turns, unlike its width.
+                // The chest box may be trimmed (the estimator accepts 60% of it)
+                // but the head may not: nothing tolerates half a face.
+                const float HEAD = 0.40f, CHEST = 1.05f;
+                const float fcy = (f.box[1] + f.box[3]) / 2 + (CHEST - HEAD) / 2 * fh;
                 // Face box -> sensor coordinates through the current window. The
                 // sensor may be mirroring and flipping what it reads out (the
                 // auto-rotation does exactly that), and the window is in sensor
@@ -584,20 +635,30 @@ static void cam_task(void *)
                 const int sy = win.y + int(sen->status.vflip ? win.h - 1 - oy : oy);
                 // compare the window we would actually get (clamped), or a
                 // centred subject can never satisfy the size condition
-                const int want_w = std::clamp(int(3.2f * fw * win.w / W), 4 * W, ARR_W);
-                const bool moved = std::abs(sx - (win.x + win.w / 2)) > win.w / 6 ||
+                // The window keeps the frame's aspect, so the height that must
+                // fit sets the width; widen a little more when the face was
+                // being clipped, since the crop was evidently too tight.
+                const float span = (HEAD + 1.0f + CHEST) * fh * (clipped ? 1.15f : 1.0f);
+                const float want = std::max(span * W / H, 2.6f * fw);
+                const int want_w = std::clamp(int(want * win.w / W), 4 * W, ARR_W);
+                const bool moved = clipped ||
+                                   std::abs(sx - (win.x + win.w / 2)) > win.w / 6 ||
                                    std::abs(sy - (win.y + win.h / 2)) > win.h / 6 ||
                                    std::abs(want_w - win.w) > win.w / 5;
                 if (moved) {
                     apply_window(sx, sy, want_w);
                     break_history(now);
                     last_zoom = now;
+                    // the face we have was seen through the old window
+                    xSemaphoreTake(face_mtx, portMAX_DELAY);
+                    g_face.valid = false;
+                    xSemaphoreGive(face_mtx);
                     for (int i = 0; i < 3; i++) {  // drop frames captured with the old window
                         camera_fb_t *old = esp_camera_fb_get();
                         if (old) esp_camera_fb_return(old);
                     }
                 }
-            } else if (!face_ok && win.w < ARR_W && now - last_zoom > 5000000) {
+            } else if (!face_ok && win.w < ARR_W && now - last_zoom > 8000000) {
                 ESP_LOGI(TAG, "face lost: widening the sensor window");
                 apply_window(ARR_W / 2, ARR_H / 2, ARR_W);
                 break_history(now);
@@ -757,6 +818,7 @@ static void detect_task(void *)
             det_busy = false;
             continue;
         }
+        beat(BEAT_DET);
         misses = best ? 0 : misses + 1;
         stats.det_hit = 0.95f * stats.det_hit + (best ? 0.05f : 0);
 
@@ -828,6 +890,7 @@ static void hr_task(void *)
     TickType_t last = xTaskGetTickCount();
     for (;;) {
         xTaskDelayUntil(&last, pdMS_TO_TICKS(1000));
+        beat(BEAT_HR);
         xSemaphoreTake(buf_mtx, portMAX_DELAY);
         const int n = g_buf->copy(tmp);
         const int rn = g_rbuf->copy(rtmp);
@@ -848,10 +911,11 @@ static void hr_task(void *)
         xSemaphoreGive(face_mtx);
         out_printf("HR bpm=%.1f raw=%.1f snr=%.1f q=%.2f stab=%.2f coh=%.2f state=%s motion=%.2f "
                    "rois=%d face=%d det_hit=%.2f skin_lvl=%.0f fps=%.1f det_fps=%.1f det_ms=%.0f est_ms=%.0f evm_ms=%.1f "
-                   "mode=%s\n",
+                   "jpeg=%.0fms/%.1fkB tx=%.0fms mode=%s\n",
                    r.bpm, r.bpm_raw, r.snr_db, r.quality, r.stability, r.coherence, state_name(r.state),
                    r.motion, r.rois_used, face, stats.det_hit, stats.roi_level, stats.cam_fps, stats.det_fps,
-                   stats.det_ms, ms, stats.evm_ms, cfg.mono ? "mono" : "rgb");
+                   stats.det_ms, ms, stats.evm_ms, stats.jpeg_ms, stats.jpeg_kb, stats.tx_ms,
+                   cfg.mono ? "mono" : "rgb");
 
         g_rest->set_band(cfg.infant ? resp::Band::INFANT : resp::Band::ADULT);
         const int64_t t1 = esp_timer_get_time();
@@ -864,10 +928,10 @@ static void hr_task(void *)
         for (int i = 0, o = 0; i < 8 && rr.sel[i] >= 0 && o < (int)sizeof(sel) - 4; i++)
             o += snprintf(sel + o, sizeof(sel) - o, o ? ",%d" : "%d", rr.sel[i]);
         out_printf("RR br=%.1f raw=%.1f snr=%.1f q=%.2f stab=%.2f agree=%.2f state=%s motion=%.2f ch=%d best=%d "
-                   "sel=%s drop=%d/%d/%d/%d band=%s est_ms=%.0f\n",
+                   "sel=%s drop=%d/%d/%d/%d breathing=%s x%.1f quiet=%.0fs band=%s est_ms=%.0f\n",
                    rr.brpm, rr.raw, rr.snr_db, rr.quality, rr.stability, rr.agreement, state_name(rr.state), rr.motion,
                    rr.channels, rr.best, sel[0] ? sel : "-", rr.n_nodata, rr.n_still, rr.n_masked, rr.n_weak,
-                   cfg.infant ? "infant" : "adult", rms);
+                   rr.present ? "seen" : "none", rr.presence, rr.quiet_s, cfg.infant ? "infant" : "adult", rms);
     }
 }
 
@@ -888,13 +952,18 @@ static void stream_task(void *)
             stats.evm_ms = 0.9f * stats.evm_ms + 0.1f * (esp_timer_get_time() - t0) / 1000.0f;
         }
         dl::image::img_t img = {str_frame, W, H, dl::image::DL_IMAGE_PIX_TYPE_YUYV};
+        const int64_t enc0 = esp_timer_get_time();
         dl::image::jpeg_img_t jpg = dl::image::sw_encode_jpeg(img, cfg.quality);
+        stats.jpeg_ms = 0.9f * stats.jpeg_ms + 0.1f * (esp_timer_get_time() - enc0) / 1000.0f;
         if (jpg.data) {
+            stats.jpeg_kb = 0.9f * stats.jpeg_kb + 0.1f * jpg.data_len / 1024.0f;
+            const int64_t tx0 = esp_timer_get_time();
             uint32_t hdr[2] = {uint32_t(jpg.data_len), str_t_ms};
             xSemaphoreTake(out_mtx, portMAX_DELAY);
             if (out_raw("HCF2", 4) && out_raw(hdr, sizeof(hdr)) && out_raw(str_meta, sizeof(str_meta)))
                 out_raw(jpg.data, jpg.data_len);
             xSemaphoreGive(out_mtx);
+            stats.tx_ms = 0.9f * stats.tx_ms + 0.1f * (esp_timer_get_time() - tx0) / 1000.0f;
             heap_caps_free(jpg.data);
         }
         str_busy = false;
@@ -904,10 +973,21 @@ static void stream_task(void *)
 static void led_task(void *)
 {
     int64_t last_beat = 0;
+    const char *beat_name[BEAT_N] = {"camera", "detector", "estimator"};
+    for (auto &b : beats) b.store(esp_timer_get_time(), std::memory_order_relaxed);
     for (;;) {
         xSemaphoreTake(stats.mtx, portMAX_DELAY);
         const rppg::Result r = stats.res;
         xSemaphoreGive(stats.mtx);
+
+        // watchdog: a task that has stopped stamping is not coming back
+        for (int i = 0; i < BEAT_N; i++) {
+            if (esp_timer_get_time() - beats[i].load(std::memory_order_relaxed) > BEAT_TIMEOUT_US) {
+                ESP_LOGE(TAG, "%s task stopped responding: restarting", beat_name[i]);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                esp_restart();
+            }
+        }
         const int64_t now = esp_timer_get_time();
         if (r.state == rppg::LOCKED && r.bpm > 30) {
             const int64_t period = int64_t(60e6f / r.bpm);
@@ -1039,8 +1119,10 @@ extern "C" void app_main(void)
     g_rest = new (std::nothrow) resp::Estimator();
     g_tiles = new (std::nothrow) resp::TileMotion();
     g_evm = new (std::nothrow) evm::Magnifier();
-    det_frame = (uint8_t *)heap_caps_malloc(W * H * 2, MALLOC_CAP_SPIRAM);
-    str_frame = (uint8_t *)heap_caps_malloc(W * H * 2, MALLOC_CAP_SPIRAM);
+    // 16-byte aligned: the JPEG encoder silently falls back to a slow C path
+    // for an unaligned input, which was costing most of the preview frame rate.
+    det_frame = (uint8_t *)heap_caps_aligned_alloc(16, W * H * 2, MALLOC_CAP_SPIRAM);
+    str_frame = (uint8_t *)heap_caps_aligned_alloc(16, W * H * 2, MALLOC_CAP_SPIRAM);
     if (!g_buf || !g_est || !g_rbuf || !g_rest || !g_tiles || !g_evm || !det_frame || !str_frame || !out_mtx ||
         !face_mtx || !buf_mtx || !stats.mtx || !det_sem || !str_sem) {
         fatal("out of memory during start-up");

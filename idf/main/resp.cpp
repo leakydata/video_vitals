@@ -146,6 +146,7 @@ void Estimator::reset()
 {
     trk_.reset();
     prev_best_ = -1;
+    seen_ = false;
     std::memset(wave_, 0, sizeof(wave_));
 }
 
@@ -301,6 +302,47 @@ void Estimator::spectrum(const float *x, float *P)
     for (int k = 0; k < nb_ext_; k++) P[k] = re[K0 + k] * re[K0 + k] + im[K0 + k] * im[K0 + k];
 }
 
+// Is there breathing motion *now*? Independent of the rate: band-pass the last
+// few seconds of the strongest channels and compare their movement with the
+// floor set by the quietest ones (which measure the scene's own noise).
+void Estimator::check_presence(const MotionSample *s, int n, Result &r)
+{
+    constexpr float RECENT_S = 8.0f;     // long enough for one slow breath
+    constexpr float FLOOR_PX = 0.03f;    // below this, nothing is moving at all
+    const uint32_t t_end = s[n - 1].t_ms;
+    float best = 0, quiet[kChan], nq = 0;
+    for (int ch = 0; ch < kChan; ch++) {
+        const uint64_t bit = 1ull << ch;
+        float mn = 1e9f, mx = -1e9f;
+        int cnt = 0;
+        for (int k = n - 1; k >= 0 && rppg::ms_diff(t_end, s[k].t_ms) < RECENT_S * 1000; k--) {
+            if (!(s[k].valid & bit) || (s[k].jump & bit) || s[k].gross) continue;
+            mn = std::fmin(mn, s[k].d[ch]);
+            mx = std::fmax(mx, s[k].d[ch]);
+            cnt++;
+        }
+        if (cnt < 10) continue;
+        const float swing = mx - mn;
+        quiet[int(nq++)] = swing;
+        best = std::fmax(best, swing);
+    }
+    if (nq < 4) {   // nothing usable to judge from
+        r.present = false;
+        r.presence = 0;
+        r.quiet_s = seen_ ? rppg::ms_diff(t_end, last_seen_ms_) / 1000.0f : 0;
+        return;
+    }
+    std::sort(quiet, quiet + int(nq));
+    const float floor_swing = std::fmax(quiet[int(nq) / 4], FLOOR_PX);  // the scene's own restlessness
+    r.presence = best / floor_swing;
+    r.present = best > FLOOR_PX && r.presence > 2.0f;
+    if (r.present) {
+        last_seen_ms_ = t_end;
+        seen_ = true;
+    }
+    r.quiet_s = seen_ ? rppg::ms_diff(t_end, last_seen_ms_) / 1000.0f : 0;
+}
+
 Result Estimator::update(const MotionSample *s, int n, uint32_t now_ms)
 {
     Result r{};
@@ -313,6 +355,7 @@ Result Estimator::update(const MotionSample *s, int n, uint32_t now_ms)
         trk_.no_signal();
         return r;  // no usable window: report nothing, not the last tracked value
     }
+    check_presence(s, n, r);
     const float (*sos)[6] = band_ == Band::ADULT ? SOS_ADULT : SOS_INFANT;
     r.motion = mask(s, n, -1, wg_);
 

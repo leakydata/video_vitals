@@ -160,35 +160,10 @@ Current results:
   dark (`skin_lvl` in the `HR` line, ~120-160 is healthy); press `a` to force it.
 - The rate is reported once the tracker is `locked` (needs ~15 s).
 
-## Eulerian magnification **on the device** (`E1` / `E2`)
+## Eulerian magnification
 
-The original goal: proving Eulerian video magnification can run on a $15
-microcontroller. It does — `idf/main/evm.cpp`, **28 ms per QVGA frame** on the
-ESP32-S3 (so up to ~35 fps if frames were spare), applied to the streamed
-preview only.
-
-How it fits in 28 ms: the temporal filtering happens at a coarse pyramid level
-(40x30), so only the add-back touches every pixel, and that inner loop is a
-table lookup plus one add. The first attempt did per-pixel divisions and
-repeated PSRAM reads and took 528 ms.
-
-The amplified band is capped (+/-60 levels): the linear method assumes small
-changes, so a real movement — someone turning their head — would otherwise blow
-the picture out. Subtle motion is exaggerated; gross motion is not.
-
-**It changes only what is watched.** The vitals are always measured from the
-untouched frame, and magnification runs on the preview copy.
-
-## The same thing in the viewer (display only)
-
-Verified against the original MIT demo clips in `data/evm/`:
-- colour magnification on `face.mp4`: pulse-band swing amplified 3.1x
-- motion magnification on `baby.mp4`: periodic swing amplified 16x; the
-  magnified torso shows ~31 breaths/min, a plausible infant rate (frame edges
-  show ~10/min — camera and room motion, not the baby)
-
-It exists to make the signal visible to a person. The vitals themselves are
-measured from the unamplified frames: amplification would only add noise.
+Proved on the board (28 ms per QVGA frame) and then parked: it is off by default
+and the vitals never depend on it. See `docs/eulerian_magnification.md`.
 
 ## Roadmap
 - Breathing: validate against the MR60BHA2 radar; a face-anchored chest ROI;

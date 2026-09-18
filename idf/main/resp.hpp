@@ -34,6 +34,12 @@ enum class Band : uint8_t { ADULT, INFANT };
 
 struct Result {
     rppg::State state;
+    // Presence is deliberately separate from the rate: a 30 s window cannot say
+    // whether breathing is happening *now*, and for a monitor that is the
+    // question that matters. Measured over the last few seconds only.
+    bool present;      // breathing motion seen in the recent window
+    float presence;    // how strong it was, relative to the detection floor
+    float quiet_s;     // seconds since breathing motion was last seen
     float brpm;       // tracked breaths per minute (0 if none)
     float raw;        // this window's peak
     float snr_db;
@@ -73,6 +79,7 @@ private:
     bool resample(const MotionSample *s, int n, int ch, float *x);
     float mask(const MotionSample *s, int n, int ch, float *w);
     void spectrum(const float *x, float *P);
+    void check_presence(const MotionSample *s, int n, Result &r);
 
     Band band_ = Band::ADULT;
     int nb_ = 0, nb_ext_ = 0;
@@ -84,6 +91,8 @@ private:
     rppg::Tracker trk_;
     int prev_best_ = -1;
     int sticky_ = 0;
+    uint32_t last_seen_ms_ = 0;
+    bool seen_ = false;
     bool still_ = false;   // last resample() bailed because the channel barely moved
 };
 

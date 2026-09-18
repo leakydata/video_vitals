@@ -12,7 +12,8 @@ The heart rate is computed on the ESP32. This viewer shows:
 
 Keys: q quit | m magnification | a re-auto-expose | r rotate 180
       +/- exposure | M toggle mono(IR) mode | b adult/infant breathing band
-      m right-hand view: off / pulse (colour) / breathing (motion)
+      m right-hand view (viewer-side): off / pulse (colour) / breathing (motion)
+      E magnification on the BOARD itself: off / motion / pulse
       p breathing pacer on/off, [ ] pacer rate | z sensor zoom | s snapshot
 
 The pacer rate can also be set from outside while the viewer runs, by writing a
@@ -400,12 +401,15 @@ def main():
     ap.add_argument("--single", action="store_true", help="one video feed only (no magnified view)")
     ap.add_argument("--alpha", type=float, default=60.0, help="colour (pulse) magnification factor")
     ap.add_argument("--motion-alpha", type=float, default=25.0, help="motion (breathing) magnification factor")
+    ap.add_argument("--device-magnify", choices=("off", "motion", "pulse"), default="off",
+                    help="magnify on the BOARD itself (the streamed video is then already magnified)")
     ap.add_argument("--max-width", type=int, default=0, help="largest window width (0 = detect the screen)")
     ap.add_argument("--pos", default="60,60", help="window position x,y (multi-monitor desktops can hide it)")
     ap.add_argument("--headless", action="store_true", help="no window; print the device heart rate")
     ap.add_argument("--no-video", action="store_true", help="do not stream video (faster on-device fps)")
     ap.add_argument("--seconds", type=float, default=0, help="stop after N seconds")
     ap.add_argument("--record", help="save the raw serial stream (video + samples + HR) to this file")
+    ap.add_argument("--zoom", action="store_true", help="start with the sensor zoom following the face")
     ap.add_argument("--pacer", type=float, default=0, help="start the breathing pacer at this rate (/min)")
     ap.add_argument("--pacer-file", default="/tmp/heartcam_pacer",
                     help="write a rate (or 'off') to this file to change the pacer while running")
@@ -427,6 +431,10 @@ def main():
 
     dev = Device(args.port, args.record)
     dev.send("v", startup=True)
+    dev_mag = {"off": 0, "motion": 1, "pulse": 2}[args.device_magnify]
+    dev.send(f"E{dev_mag}", startup=True)
+    if args.zoom:
+        dev.send("z1", startup=True)
     if not args.no_video and not args.headless:
         dev.send("s", startup=True)
     dev.start()
@@ -442,7 +450,7 @@ def main():
     if not args.headless:
         cv2.namedWindow(WINDOW, cv2.WINDOW_AUTOSIZE)
         cv2.moveWindow(WINDOW, *args.pos)        # a desktop spanning several screens can place it off-view
-    zoom = False
+    zoom = args.zoom
     pacer_on, pacer_rate, pacer_t0 = args.pacer > 0, args.pacer or 10.0, time.time()
     if pacer_on:
         dev.mark(f"pacer on rate={pacer_rate:.0f}")
@@ -487,6 +495,10 @@ def main():
                     dt = t - last_t if last_t and 0 < t - last_t < 1 else 0.1
                     last_t = t
                     left = frame.copy()
+                    if dev_mag:
+                        cv2.putText(left, ("", "magnified on the board (motion)",
+                                           "magnified on the board (pulse)")[dev_mag],
+                                    (6, 232), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 200, 80), 1)
                     draw_overlay(left, meta)
                     draw_boxes(left, meta)
                     sel = [int(c) for c in dev.rr.get("sel", "").split(",") if c.strip().lstrip("-").isdigit()]
@@ -605,6 +617,10 @@ def main():
                 pacer_rate = float(np.clip(pacer_rate + (1 if key == ord("]") else -1), 4, 40))
                 pacer_t0 = time.time()
                 dev.mark(f"pacer {'on' if pacer_on else 'off'} rate={pacer_rate:.0f} t={time.time():.3f}")
+            elif key == ord("E"):
+                dev_mag = (dev_mag + 1) % 3
+                dev.send(f"E{dev_mag}")
+                print(f"[viewer] board magnification: {('off', 'motion', 'pulse')[dev_mag]}")
             elif key == ord("z"):
                 zoom = not zoom
                 dev.send("z1" if zoom else "z0")
