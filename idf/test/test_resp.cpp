@@ -355,6 +355,7 @@ int main(int argc, char **argv)
         {"fast 30/min, 0.4 px", 75, hr(30), 0.4f},
         {"shallow 12/min, 0.15 px", 75, hr(12), 0.15f},
         {"infant 45/min (infant band)", 75, hr(45), 0.3f, Band::INFANT},
+        {"infant 70/min (top of the band)", 75, hr(70), 0.3f, Band::INFANT},
         {"change 12->20/min at 40-50 s", 90, [](float t) { return t < 40 ? 12 : (t > 50 ? 20.0f : 12 + 0.8f * (t - 40)); },
          0.5f, Band::ADULT, 2.0f, 0, 0.3f, 0.05f, [](float) { return false; }, 2.5f},
         {"gross motion 2 s every 20 s, 16/min", 90, hr(16), 0.5f, Band::ADULT, 2.0f, 0, 0.3f, 0.05f,

@@ -15,7 +15,10 @@ constexpr float SNR_MID = 5.0f;    // SNR (dB) at which the SNR quality term is 
 // (fused noise sits at 0-3 dB; real breathing is typically >8 dB)
 constexpr float MOTION_MAX = 0.5f; // max masked fraction for an update
 constexpr int MAX_FUSED = 8;
-constexpr int MIN_FUSED = 3;   // fuse at least this many when available, so agreement means something
+constexpr int MIN_FUSED = 3;
+// Anti-alias filter: POLES one-pole sections, each run forward and backward.
+constexpr float FC = 2.0f;
+constexpr int POLES = 3;   // fuse at least this many when available, so agreement means something
 constexpr float SELECT_DB = 6.0f;  // fuse channels within this many dB of the best
 constexpr float STICKY_DB = 3.0f;       // how much better a rival channel must be to take over
 constexpr int STICKY_UPDATES = 3;       // ... and for how many consecutive windows
@@ -265,8 +268,6 @@ bool Estimator::resample(const MotionSample *s, int n, int ch, float *x)
     // A single pole only reaches about -15 dB near the frame rate, so cascade
     // three each way (six poles, zero phase). At 2 Hz this leaves the breathing
     // band (up to 1.3 /s for infants) usable while burying anything faster.
-    constexpr float FC = 2.0f;
-    constexpr int POLES = 3;
     // The frame interval barely varies, so cache the filter coefficient rather
     // than calling exp() for every sample of every channel (which cost ~300 ms
     // per update on the S3).
@@ -276,6 +277,7 @@ bool Estimator::resample(const MotionSample *s, int n, int ch, float *x)
     // channel cost hundreds of milliseconds per update on the S3.
     const float mean_dt = std::max(1e-3f, (rt[m - 1] - rt[0]) / 1000.0f / (m - 1));
     const float alpha = 1 - std::exp(-2 * float(M_PI) * FC * mean_dt);
+    aa_compensation(alpha, mean_dt);
     for (int pass = 0; pass < POLES; pass++) {
         float y = rv[0];
         for (int k = 1; k < m; k++) { y += alpha * (rv[k] - y); rv[k] = y; }
@@ -292,6 +294,34 @@ bool Estimator::resample(const MotionSample *s, int n, int ch, float *x)
     return true;
 }
 
+// The anti-alias filter has to be steep to keep anything above 2.5 Hz from
+// folding into the breathing band, and steep means it also leans on the top of
+// that band: six one-poles at 2 Hz cost about 8 dB at 1.3 Hz, which is 78 /min,
+// the fastest rate the infant band has to be able to find. Uncorrected, that
+// tilt biases every comparison across the band towards the slower candidate --
+// including the choice between a rate and half of it. The response is known
+// exactly from the filter's own coefficient, so it is divided back out of the
+// spectrum: peaks are then judged on equal terms, while the filtering itself,
+// and the aliasing it prevents, is untouched. The correction is capped, because
+// beyond the breathing band it would only be amplifying what the filter was
+// there to bury.
+void Estimator::aa_compensation(float alpha, float dt)
+{
+    if (alpha == aa_alpha_ && dt == aa_dt_) return;
+    aa_alpha_ = alpha;
+    aa_dt_ = dt;
+    const float b = 1 - alpha;
+    for (int k = 0; k < nb_ext_; k++) {
+        const float f = (K0 + k) * FS / NFFT;             // Hz
+        const float w = 2 * float(M_PI) * f * dt;         // radians per raw sample
+        // one pole, forward and back; the cascade runs POLES of those
+        const float h2 = alpha * alpha / (1 - 2 * b * std::cos(w) + b * b);
+        float g = 1.0f;
+        for (int i = 0; i < 2 * POLES; i++) g *= h2;      // power response of the cascade
+        aa_gain_[k] = std::fmin(1.0f / std::fmax(g, 1e-6f), 16.0f);
+    }
+}
+
 void Estimator::spectrum(const float *x, float *P)
 {
     float re[NFFT], im[NFFT];
@@ -299,7 +329,8 @@ void Estimator::spectrum(const float *x, float *P)
     for (int i = N; i < NFFT; i++) re[i] = 0;
     for (int i = 0; i < NFFT; i++) im[i] = 0;
     rppg::fft(re, im, NFFT);
-    for (int k = 0; k < nb_ext_; k++) P[k] = re[K0 + k] * re[K0 + k] + im[K0 + k] * im[K0 + k];
+    for (int k = 0; k < nb_ext_; k++)
+        P[k] = (re[K0 + k] * re[K0 + k] + im[K0 + k] * im[K0 + k]) * aa_gain_[k];
 }
 
 // Is there breathing motion *now*? Independent of the rate: band-pass the last

@@ -95,6 +95,11 @@ private:
     uint32_t last_seen_ms_ = 0;
     bool seen_ = false;
     bool still_ = false;   // last resample() bailed because the channel barely moved
+    // The anti-alias filter's own response, divided back out of the spectrum
+    // (see spectrum()). Cached: it only changes when the frame rate does.
+    float aa_gain_[NB_EXT_MAX] = {};
+    float aa_alpha_ = 0, aa_dt_ = 0;
+    void aa_compensation(float alpha, float dt);
 };
 
 } // namespace resp
