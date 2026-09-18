@@ -23,9 +23,9 @@ Everything else is done, measured and written down.
 
 ## Everything, verified on one clean build
 
-I rebuilt the firmware from `fullclean`, rebuilt every host tool from scratch, reflashed
-the board, and re-ran every measurement against that single build, so these numbers are
-all from the same code rather than accumulated across the night.
+Every number here was re-run against the code that is on the board right now — rebuilt
+from `fullclean`, host tools recompiled from scratch — rather than accumulated across the
+night as the code changed underneath them. The last re-run was after the final review fix.
 
 | | |
 |---|---|
