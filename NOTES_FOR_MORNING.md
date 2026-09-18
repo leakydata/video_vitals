@@ -3,6 +3,24 @@
 Everything below is committed and pushed. Last night's notes are in
 `docs/notes_2026-09-17.md`.
 
+## If you only read one thing
+
+The device no longer states numbers it cannot support. That was true of the desk case
+already; overnight it became true of the cot case too, which is the one the product is
+actually for, and where it had been **wrong in every single window** it reported.
+
+Three things need you, and only you can do them:
+
+1. **A lit empty room.** Leave a lamp on and the chair empty for twenty minutes. Every
+   empty-room hour I have is dark, and darkness is a different failure mode from the one
+   that matters. This is the test that would let me finish the presence detector.
+2. **A daylight recording of you.** Same reason: everything I had to calibrate against was
+   shot in a dim room.
+3. **A decision about Codex** — it never ran, five attempts, all account or version
+   rejections. Details below.
+
+Everything else is done, measured and written down.
+
 ## Everything, verified on one clean build
 
 I rebuilt the firmware from `fullclean`, rebuilt every host tool from scratch, reflashed
@@ -15,7 +33,7 @@ all from the same code rather than accumulated across the night.
 | Breathing suite | **80/80** (5 seeds) |
 | Heart rate on UBFC | **1.97 bpm MAE, 94% locked**, 100% within 5 bpm |
 | Infant clips (AIR-400) | **0 confidently wrong windows** (was 93 of 93) |
-| Empty room, all night | **9,192 windows, 0 false readings of either kind** |
+| Empty room, all night | **14,577 windows, 0 false readings of either kind** |
 | Faults, restarts, camera failures | **0** |
 | Frame rate | 14.80 fps |
 

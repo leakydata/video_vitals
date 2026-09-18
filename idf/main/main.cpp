@@ -668,13 +668,14 @@ static void cam_task(void *)
                 const float ox = fcx * win.w / W, oy = fcy * win.h / H;
                 const int sx = win.x + int(sen->status.hmirror ? win.w - 1 - ox : ox);
                 const int sy = win.y + int(sen->status.vflip ? win.h - 1 - oy : oy);
-                // compare the window we would actually get (clamped), or a
-                // centred subject can never satisfy the size condition
                 // The window keeps the frame's aspect, so the height that must
                 // fit sets the width; widen a little more when the face was
                 // being clipped, since the crop was evidently too tight.
                 const float span = (HEAD + 1.0f + CHEST) * fh * (clipped ? 1.15f : 1.0f);
                 const float want = std::max(span * W / H, 2.6f * fw);
+                // clamped, because the comparison below must be against the
+                // window we would actually get: a centred subject could
+                // otherwise never satisfy the size condition
                 const int want_w = std::clamp(int(want * win.w / W), 4 * W, ARR_W);
                 const bool moved = clipped ||
                                    std::abs(sx - (win.x + win.w / 2)) > win.w / 6 ||
