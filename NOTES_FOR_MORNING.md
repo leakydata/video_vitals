@@ -233,6 +233,23 @@ you are at the edge of the *sensor*, the crop cannot move further, the face stay
 whatever it does, and it would have re-aimed every three seconds indefinitely — a second
 of lost signal each time. It now backs off after three attempts.
 
+A second pass over the same diff found two more, both of the kind that only bite when
+something else has already gone wrong:
+
+**The watchdog measured its deadline from boot, not from when the tasks started.** The
+heartbeats begin at zero, so until each task first stamped one, "twenty seconds without a
+heartbeat" meant "twenty seconds since power-on". Every task does stamp well inside that
+today, so this was a latent dependency rather than a live bug — but it made a slow start
+indistinguishable from a hang, in the one piece of code whose whole job is telling those
+apart.
+
+**Settings were lost whenever the board reconnected.** The viewer replays its startup
+commands after a reconnect, but a watch region, band or zoom chosen *later* was not among
+them. The board forgets everything when it restarts — and it now restarts itself if a task
+hangs — so the region you drew over the cot would quietly stop applying while the viewer
+carried on drawing it. That is the sort of thing that would have looked like "the monitor
+just stopped working overnight" and been very hard to explain afterwards.
+
 One observation while I was in there, not a bug and not new: the breathing estimator takes
 about **280 ms per update** when the channels are live — roughly a third of a core, once a
 second. Tonight's changes did not add to it (measured on identical input: 1.19 s before,
