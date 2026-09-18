@@ -179,10 +179,15 @@ void TileMotion::process_yuyv(const uint8_t *px, int w, int h, uint32_t t_ms, bo
         // that causes is known from the geometry and is corrected below. Only a
         // resize (which stretches the profile rather than shifting it) or a move
         // far enough to look at different content needs a new reference.
+        // The correction below is a shift, and the fit can only measure a few
+        // bins of shift, so the box may only slide as far as that: past it the
+        // correction would silently saturate and report the wrong displacement,
+        // which is worse than taking a fresh reference.
+        const float slide_x = 2.0f * b.w / kBoxProf, slide_y = 2.0f * b.h / kBoxProf;
         const bool moved = !have_box_[i] || std::abs(b.w - box_ref_[i].w) > 2 ||
                            std::abs(b.h - box_ref_[i].h) > 2 ||
-                           std::abs(b.x - box_ref_[i].x) > b.w / 8 ||
-                           std::abs(b.y - box_ref_[i].y) > b.h / 8;
+                           std::abs(b.x - box_ref_[i].x) > slide_x ||
+                           std::abs(b.y - box_ref_[i].y) > slide_y;
         if (moved) {
             // the box moved: its old reference means nothing, and the step that
             // causes must not be read as breathing

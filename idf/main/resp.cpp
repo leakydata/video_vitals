@@ -15,10 +15,10 @@ constexpr float SNR_MID = 5.0f;    // SNR (dB) at which the SNR quality term is 
 // (fused noise sits at 0-3 dB; real breathing is typically >8 dB)
 constexpr float MOTION_MAX = 0.5f; // max masked fraction for an update
 constexpr int MAX_FUSED = 8;
-constexpr int MIN_FUSED = 3;
+constexpr int MIN_FUSED = 3;  // fuse at least this many when available, so agreement means something
 // Anti-alias filter: POLES one-pole sections, each run forward and backward.
 constexpr float FC = 2.0f;
-constexpr int POLES = 3;   // fuse at least this many when available, so agreement means something
+constexpr int POLES = 3;
 constexpr float SELECT_DB = 6.0f;  // fuse channels within this many dB of the best
 constexpr float STICKY_DB = 3.0f;       // how much better a rival channel must be to take over
 constexpr int STICKY_UPDATES = 3;       // ... and for how many consecutive windows

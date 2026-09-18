@@ -332,14 +332,35 @@ static int box_jitter_tests()
     };
     const float jitter_only = run(true, false);
     const float content_only = run(false, true);
+    // A slide bigger than the fit can measure must be re-keyed, not corrected:
+    // past a couple of bins the correction saturates and would report a large
+    // displacement that never happened.
+    auto big_slide = [&]() {
+        TileMotion tm;
+        float lo = 1e9f, hi = -1e9f;
+        for (int f = 0; f < 120; f++) {
+            const float t = f / 20.0f;
+            render(0.0f);                          // the scene never moves
+            const int16_t dy = int16_t(f > 60 ? 12 : 0);   // the box jumps once, a long way
+            const Box boxes[kBoxes] = {{70, int16_t(130 + dy), 180, 100}, {120, 30, 80, 100}};
+            MotionSample ms;
+            tm.process_yuyv(frame.data(), W, H, uint32_t(t * 1000), false, boxes, ms);
+            if (f < 40 || !(ms.valid & (1ull << kBoxChan0))) continue;
+            lo = std::fmin(lo, ms.d[kBoxChan0]);
+            hi = std::fmax(hi, ms.d[kBoxChan0]);
+        }
+        return hi - lo;
+    };
+    const float slid = big_slide();
     struct { const char *name; bool ok; } checks[] = {
         {"a jittering box on a frozen scene reports no motion", jitter_only < 0.4f},
         {"a still box over moving content still reports it", content_only > 1.0f},
+        {"a box sliding further than the fit can see is re-keyed", slid < 1.0f},
     };
     int fails = 0;
     for (auto &c : checks) {
-        std::printf("  %-52s jitter=%.2f content=%.2f px  %s\n", c.name, jitter_only, content_only,
-                    c.ok ? "PASS" : "FAIL");
+        std::printf("  %-52s jitter=%.2f content=%.2f slide=%.2f px  %s\n", c.name, jitter_only,
+                    content_only, slid, c.ok ? "PASS" : "FAIL");
         fails += !c.ok;
     }
     return fails;
@@ -427,7 +448,7 @@ int main(int argc, char **argv)
             if (std::string(s.name).find(argv[2]) != std::string::npos) f.push_back(s);
         sc = f;
     }
-    int fails = feed_tests() + region_tests() + box_jitter_tests() + presence_tests(), total = 14;
+    int fails = feed_tests() + region_tests() + box_jitter_tests() + presence_tests(), total = 15;
     for (auto &s : sc)
         for (int seed = 1; seed <= seeds; seed++) {
             fails += run(s, seed);

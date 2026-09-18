@@ -641,7 +641,12 @@ static void cam_task(void *)
             const bool clipped = face_fresh &&
                                  (f.box[0] < EDGE * W || f.box[2] > (1 - EDGE) * W ||
                                   f.box[1] < EDGE * H || f.box[3] > (1 - EDGE) * H);
-            const int64_t wait = clipped ? 3000000 : 20000000;
+            // ... but only a few times in a row. If the subject is against the
+            // edge of the sensor itself the crop cannot move any further, the
+            // face stays clipped whatever we do, and re-aiming every three
+            // seconds would throw away a second of signal each time for nothing.
+            static int urgent_run = 0;
+            const int64_t wait = clipped && urgent_run < 3 ? 3000000 : 20000000;
             if (face_fresh && now - last_zoom > wait) {  // re-aiming costs ~1 s of signal
                 const float fw = f.box[2] - f.box[0], fh = f.box[3] - f.box[1];
                 const float fcx = (f.box[0] + f.box[2]) / 2;
@@ -676,6 +681,7 @@ static void cam_task(void *)
                                    std::abs(sy - (win.y + win.h / 2)) > win.h / 6 ||
                                    std::abs(want_w - win.w) > win.w / 5;
                 if (moved) {
+                    urgent_run = clipped ? urgent_run + 1 : 0;
                     apply_window(sx, sy, want_w);
                     break_history(now);
                     last_zoom = now;
@@ -688,7 +694,9 @@ static void cam_task(void *)
                         if (old) esp_camera_fb_return(old);
                     }
                 }
+                if (!clipped) urgent_run = 0;
             } else if (!face_ok && win.w < ARR_W && now - last_zoom > 8000000) {
+                urgent_run = 0;
                 ESP_LOGI(TAG, "face lost: widening the sensor window");
                 apply_window(ARR_W / 2, ARR_H / 2, ARR_W);
                 break_history(now);
