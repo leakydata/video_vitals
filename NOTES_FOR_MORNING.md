@@ -147,6 +147,33 @@ box is the first thing to do.
 Nothing else regressed: heart rate on UBFC is byte-identical at **1.97 bpm MAE, 94%
 locked**, and the breathing suite passes **79/79** over five seeds.
 
+### Then I found why it was that bad, and it is architectural
+
+The breathing regions are anchored to a **detected face** — the chest box is placed under
+it. On the cot footage the face detector found **nothing in 201 frames**. An infant lying
+down, seen from above in infrared, is not a face as far as the detector is concerned. No
+face means no chest box, no head box, and nothing but the fixed tile grid — which is
+exactly the configuration that was reading the wriggle.
+
+So I gave it a chest box by hand over the infant's torso, and the same firmware pipeline
+read the rate **exactly right: 19.3–19.6 /min against an annotated 19.0–19.4**, with the
+chest box as the best channel and every region agreeing.
+
+It still will not *report* it — the per-window SNR is only 2–4 dB even on the best channel,
+below the confidence gate. But it is now finding the right answer instead of a wrong one,
+and that is a completely different problem to solve.
+
+**What I built from that:** you can now drag a box over the video and the device watches
+there whenever it has no face (`c` clears it). Pointing the camera at the cot once is what
+a parent would do anyway. Verified working on the board.
+
+**What I did not do:** lower the confidence gate so it reports these marginal readings.
+That is the change that would make AIR-400 "work", and it is exactly the change that
+risks bringing back false readings — and I cannot validate it safely, because the only
+empty-room data I have is dark, where the tracker is unreliable for other reasons. It
+needs the lit empty-room recording. I am not loosening a safety threshold on evidence I
+do not have.
+
 ## Two things need you
 
 **1. Codex never ran.** Five attempts, all rejected before it read a line of code:
