@@ -15,6 +15,7 @@ Keys: q quit | m magnification | a re-auto-expose | r rotate 180
       m right-hand view (viewer-side): off / pulse (colour) / breathing (motion)
       E magnification on the BOARD itself: off / motion / pulse
       p breathing pacer on/off, [ ] pacer rate | z sensor zoom | s snapshot
+      drag a box on the video to watch that region (no face needed) | c clears it
 
 The pacer rate can also be set from outside while the viewer runs, by writing a
 number (or "off") to the file given by --pacer-file, e.g.
@@ -394,6 +395,24 @@ def fmt_status(hr):
             f"stab={hr.get('stab', '?')} coh={hr.get('coh', '?')} motion={hr.get('motion', '?')}")
 
 
+# Dragging a box over the video says "watch here". The device anchors its
+# breathing regions to a detected face, which works for someone sitting at a
+# desk and not at all for a baby lying in a cot seen from above -- the detector
+# finds no face there. Pointing at the cot once is what a parent would do
+# anyway, and it is what makes that case work.
+def on_mouse(event, x, y, flags, drag):
+    if event == cv2.EVENT_LBUTTONDOWN:
+        drag["a"] = (x, y)
+        drag["b"] = (x, y)
+        drag["down"] = True
+    elif event == cv2.EVENT_MOUSEMOVE and drag.get("down"):
+        drag["b"] = (x, y)
+    elif event == cv2.EVENT_LBUTTONUP and drag.get("down"):
+        drag["down"] = False
+        drag["b"] = (x, y)
+        drag["done"] = True
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", default="auto", help="serial port (default: find the ESP32 by USB id)")
@@ -446,10 +465,13 @@ def main():
     last_t = None
     last_print = 0
     view = None
+    drag = {"down": False, "done": False, "a": (0, 0), "b": (0, 0)}
+    watch = None            # the region the device has been told to watch
     # AUTOSIZE, not NORMAL: some window managers fail to map the resizable one.
     if not args.headless:
         cv2.namedWindow(WINDOW, cv2.WINDOW_AUTOSIZE)
         cv2.moveWindow(WINDOW, *args.pos)        # a desktop spanning several screens can place it off-view
+        cv2.setMouseCallback(WINDOW, on_mouse, drag)
     zoom = args.zoom
     pacer_on, pacer_rate, pacer_t0 = args.pacer > 0, args.pacer or 10.0, time.time()
     if pacer_on:
@@ -503,6 +525,11 @@ def main():
                     draw_boxes(left, meta)
                     sel = [int(c) for c in dev.rr.get("sel", "").split(",") if c.strip().lstrip("-").isdigit()]
                     breathing_regions(left, meta, sel, int(dev.rr.get("best", -1)))
+                    if watch:
+                        cv2.rectangle(left, (watch[0], watch[1]), (watch[0] + watch[2], watch[1] + watch[3]),
+                                      (0, 165, 255), 1)
+                        cv2.putText(left, "watching", (watch[0] + 3, watch[1] + 13),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 165, 255), 1)
                     if args.single or VIEWS[view_mode] == "off":
                         view = cv2.resize(left, None, fx=scale, fy=scale)
                     else:
@@ -515,6 +542,16 @@ def main():
                         cv2.putText(right, VIEWS[view_mode] + " magnified", (6, 14),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
                         view = cv2.resize(np.hstack([left, right]), None, fx=scale, fy=scale)
+            if drag.pop("done", False):
+                (ax, ay), (bx, by) = drag["a"], drag["b"]
+                x0, x1 = sorted((int(ax / scale), int(bx / scale)))
+                y0, y1 = sorted((int(ay / scale), int(by / scale)))
+                x0, x1 = max(0, min(319, x0)), max(0, min(320, x1))
+                y0, y1 = max(0, min(239, y0)), max(0, min(240, y1))
+                if x1 - x0 > 16 and y1 - y0 > 16:
+                    watch = (x0, y0, x1 - x0, y1 - y0)
+                    dev.send(f"C{watch[0]},{watch[1]},{watch[2]},{watch[3]}")
+                    print(f"[viewer] watching {watch}")
             if view is None:
                 view = np.zeros((int(240 * scale), int(320 * (1 if args.single else 2) * scale), 3), np.uint8)
                 msg = "video off" if args.no_video else "waiting for video..."
@@ -597,6 +634,8 @@ def main():
                 cv2.circle(panel, (PW - 22, 128), 11, (60, 60, 255), -1)
             if PW > W:   # pad a narrow video to the panel width so nothing is clipped
                 view = cv2.copyMakeBorder(view, 0, 0, 0, PW - W, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+            if drag.get("down"):
+                cv2.rectangle(view, drag["a"], drag["b"], (0, 165, 255), 1)
             cv2.imshow(WINDOW, np.vstack([view, panel]))
 
             key = cv2.waitKey(15) & 0xFF
@@ -605,6 +644,10 @@ def main():
             elif key == ord("m"):
                 view_mode = (view_mode + 1) % len(VIEWS)
                 print(f"[viewer] right-hand view: {VIEWS[view_mode]}")
+            elif key == ord("c"):
+                watch = None
+                dev.send("C0")
+                print("[viewer] watch region cleared")
             elif key == ord("a"):
                 dev.send("a")
             elif key == ord("r"):

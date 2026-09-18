@@ -145,6 +145,14 @@ static struct {
     // sensor -- it is the one that windows it, flips it and reads from it -- so
     // a request is left here and applied between frames rather than written to
     // the sensor's registers from underneath a capture that is already running.
+    // A region to watch when there is no face to anchor one to. The whole
+    // face-anchored arrangement assumes a face can be found, and for the case
+    // this is really for -- an infant lying in a cot, seen from above in
+    // infrared -- it cannot: the detector found nothing in 201 frames of real
+    // cot footage. Pointing the camera once and saying "watch there" is both
+    // what a parent would do anyway and, measured on that footage, enough to
+    // recover the breathing rate exactly.
+    volatile int16_t watch_x = 0, watch_y = 0, watch_w = 0, watch_h = 0;
     volatile int exposure_request = -1;  // AEC value, -1 = nothing pending
     volatile int gain_request = -1;      // AGC gain, -1 = nothing pending
     volatile bool evm_reset_request = false;
@@ -695,6 +703,9 @@ static void cam_task(void *)
             // head box: the face box itself, which breathing also moves slightly
             const int16_t hx = int16_t(std::lround(f.box[0])), hy = int16_t(std::lround(f.box[1]));
             boxes[1] = {hx, hy, int16_t(std::lround(f.box[2]) - hx), int16_t(std::lround(f.box[3]) - hy)};
+        } else if (cfg.watch_w > 16 && cfg.watch_h > 16) {
+            // no face: watch where we were told to
+            boxes[0] = {cfg.watch_x, cfg.watch_y, cfg.watch_w, cfg.watch_h};
         }
         const resp::Box &chest = boxes[0];
         g_tiles->process_yuyv(fb->buf, W, H, t_ms, now < f.motion_until_us || now < break_until, boxes, ms);
@@ -1067,6 +1078,20 @@ static void handle_command(char *line)
         out_printf("# preview magnification %s\n",
                    cfg.magnify == 0 ? "off" : cfg.magnify == 1 ? "motion (breathing band)" : "colour (pulse band)");
         break;
+    case 'C': {   // C x,y,w,h -- watch this region when no face is found; C0 clears
+        int x = 0, y = 0, w = 0, h = 0;
+        if (std::sscanf(line + 1, "%d,%d,%d,%d", &x, &y, &w, &h) == 4 && w > 16 && h > 16) {
+            cfg.watch_x = int16_t(std::clamp(x, 0, W - 1));
+            cfg.watch_y = int16_t(std::clamp(y, 0, H - 1));
+            cfg.watch_w = int16_t(std::clamp(w, 0, W - cfg.watch_x));
+            cfg.watch_h = int16_t(std::clamp(h, 0, H - cfg.watch_y));
+            out_printf("# watching %d,%d %dx%d\n", cfg.watch_x, cfg.watch_y, cfg.watch_w, cfg.watch_h);
+        } else {
+            cfg.watch_w = cfg.watch_h = 0;
+            out_printf("# watch region cleared\n");
+        }
+        break;
+    }
     case 'z':
         cfg.zoom = v != 0;
         if (!cfg.zoom) cfg.zoom_reset = true;

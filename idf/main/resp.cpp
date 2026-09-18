@@ -520,6 +520,13 @@ Result Estimator::update(const MotionSample *s, int n, uint32_t now_ms)
     // otherwise be judged as having no corroboration at all.
     int sel = 0;
     while (sel < m && sel < MAX_FUSED && rank(order[sel]) >= rank(order[0]) - SELECT_DB) sel++;
+    // Only channels genuinely comparable to the best are worth *averaging*: a
+    // weaker one contributes its noise across the whole band while adding
+    // little signal, and on a real infant clip that cost 2 dB at the peak. The
+    // quorum below exists so that agreement means something, which is a
+    // question about corroboration, not about what the spectrum is made of --
+    // so the two are now counted separately.
+    const int nfuse = std::max(sel, 1);
     sel = std::min(std::max(sel, MIN_FUSED), m);
     if (!sel) {
         r.state = rppg::NO_SIGNAL;
@@ -546,7 +553,7 @@ Result Estimator::update(const MotionSample *s, int n, uint32_t now_ms)
 
     float fused[NB_EXT_MAX] = {};
     float wsum = 0;
-    for (int i = 0; i < sel; i++) {
+    for (int i = 0; i < nfuse; i++) {
         const int ch = order[i];
         const float w = std::pow(10.0f, snr[ch] / 10);
         const float *P = P_ + ch * NB_EXT_MAX;
