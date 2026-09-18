@@ -12,6 +12,7 @@ The heart rate is computed on the ESP32. This viewer shows:
 
 Keys: q quit | m magnification | a re-auto-expose | r rotate 180
       +/- exposure | M toggle mono(IR) mode | b adult/infant breathing band
+      m right-hand view: off / pulse (colour) / breathing (motion)
       p breathing pacer on/off, [ ] pacer rate | z sensor zoom | s snapshot
 
 The pacer rate can also be set from outside while the viewer runs, by writing a
@@ -280,6 +281,39 @@ def breathing_wave(motion, ch, seconds=30.0):
     return sosfiltfilt(sos, x)
 
 
+class MotionMagnifier:
+    """Eulerian motion magnification (Wu et al. 2012), for watching breathing.
+
+    Movement shows up as brightness change at an edge, so band-passing each
+    pixel of a blurred, downscaled copy and adding it back exaggerates slow
+    motion. Working at a coarse pyramid level is both cheaper and what keeps the
+    noise down: fine detail amplified at these gains would be mostly sensor noise.
+
+    Display only — nothing here feeds a measurement, and it runs in the viewer
+    rather than on the board, which needs its cycles for the vitals.
+    """
+
+    def __init__(self, levels=3, lo=0.1, hi=0.8, alpha=25.0):
+        self.levels, self.lo, self.hi, self.alpha = levels, lo, hi, alpha
+        self.low1 = self.low2 = None
+
+    def set_band(self, lo, hi):
+        self.lo, self.hi = lo, hi
+
+    def __call__(self, frame, dt):
+        small = frame.astype(np.float32) / 255
+        for _ in range(self.levels):
+            small = cv2.pyrDown(small)
+        small = cv2.GaussianBlur(small, (0, 0), 1.2)   # spatial cut-off, the paper's lambda_c
+        if self.low1 is None or self.low1.shape != small.shape:
+            self.low1, self.low2 = small.copy(), small.copy()
+        self.low1 += (1 - np.exp(-2 * np.pi * self.hi * dt)) * (small - self.low1)
+        self.low2 += (1 - np.exp(-2 * np.pi * self.lo * dt)) * (small - self.low2)
+        band = (self.low1 - self.low2) * self.alpha
+        up = cv2.resize(band, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_CUBIC)
+        return (np.clip(frame.astype(np.float32) / 255 + up, 0, 1) * 255).astype(np.uint8)
+
+
 def draw_boxes(img, meta):
     """The face-anchored boxes, always shown when the device has them."""
     x, y, w, h = meta[26:30]
@@ -364,7 +398,8 @@ def main():
     ap.add_argument("--port", default="auto", help="serial port (default: find the ESP32 by USB id)")
     ap.add_argument("--scale", type=float, default=0, help="display scale (0 = fit to screen)")
     ap.add_argument("--single", action="store_true", help="one video feed only (no magnified view)")
-    ap.add_argument("--alpha", type=float, default=60.0, help="magnification factor")
+    ap.add_argument("--alpha", type=float, default=60.0, help="colour (pulse) magnification factor")
+    ap.add_argument("--motion-alpha", type=float, default=25.0, help="motion (breathing) magnification factor")
     ap.add_argument("--max-width", type=int, default=0, help="largest window width (0 = detect the screen)")
     ap.add_argument("--pos", default="60,60", help="window position x,y (multi-monitor desktops can hide it)")
     ap.add_argument("--headless", action="store_true", help="no window; print the device heart rate")
@@ -396,7 +431,9 @@ def main():
         dev.send("s", startup=True)
     dev.start()
     mag = Magnifier(alpha=args.alpha)
-    magnify = True
+    motion_mag = MotionMagnifier(alpha=args.motion_alpha)
+    VIEWS = ("off", "pulse", "breathing")
+    view_mode = 1
     exposure = 300
     last_t = None
     last_print = 0
@@ -454,10 +491,17 @@ def main():
                     draw_boxes(left, meta)
                     sel = [int(c) for c in dev.rr.get("sel", "").split(",") if c.strip().lstrip("-").isdigit()]
                     breathing_regions(left, meta, sel, int(dev.rr.get("best", -1)))
-                    if args.single:
+                    if args.single or VIEWS[view_mode] == "off":
                         view = cv2.resize(left, None, fx=scale, fy=scale)
                     else:
-                        right = mag(frame, dt) if magnify else frame
+                        if VIEWS[view_mode] == "pulse":
+                            right = mag(frame, dt)
+                        else:
+                            infant = dev.rr.get("band") == "infant"   # follow the device's band
+                            motion_mag.set_band(0.1, 1.4 if infant else 0.8)
+                            right = motion_mag(frame, dt)
+                        cv2.putText(right, VIEWS[view_mode] + " magnified", (6, 14),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
                         view = cv2.resize(np.hstack([left, right]), None, fx=scale, fy=scale)
             if view is None:
                 view = np.zeros((int(240 * scale), int(320 * (1 if args.single else 2) * scale), 3), np.uint8)
@@ -547,7 +591,8 @@ def main():
             if key == ord("q"):
                 break
             elif key == ord("m"):
-                magnify = not magnify
+                view_mode = (view_mode + 1) % len(VIEWS)
+                print(f"[viewer] right-hand view: {VIEWS[view_mode]}")
             elif key == ord("a"):
                 dev.send("a")
             elif key == ord("r"):

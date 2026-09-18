@@ -41,7 +41,10 @@ PC viewer is optional.
 - `tools/session_report.py` — plots a recording: rates, quality, motion, pacer marks
 - `tools/noise_bench.py` — measures the noise floor (frame rate, tracker jitter,
   ROI colour noise, exposure/brightness) to compare cameras, lenses or settings
-- `heartcam.py` — PC viewer (video + overlays, Eulerian magnification, pulse plot)
+- `heartcam.py` — PC viewer (video + overlays, pulse plot, and Eulerian
+  magnification: `m` cycles the right-hand view between off, pulse (colour) and
+  breathing (motion)). Magnification is display only — it runs in the viewer,
+  never on the board, and feeds no measurement.
 - `data/` — public test videos (see `data/SOURCES.md`)
 - `firmware/heart_cam/` — first Arduino prototype (superseded)
 
@@ -156,6 +159,17 @@ Current results:
   imitate a pulse. The device re-exposes itself if the skin level clips or goes
   dark (`skin_lvl` in the `HR` line, ~120-160 is healthy); press `a` to force it.
 - The rate is reported once the tracker is `locked` (needs ~15 s).
+
+## Eulerian magnification (display only)
+
+Verified against the original MIT demo clips in `data/evm/`:
+- colour magnification on `face.mp4`: pulse-band swing amplified 3.1x
+- motion magnification on `baby.mp4`: periodic swing amplified 16x; the
+  magnified torso shows ~31 breaths/min, a plausible infant rate (frame edges
+  show ~10/min — camera and room motion, not the baby)
+
+It exists to make the signal visible to a person. The vitals themselves are
+measured from the unamplified frames: amplification would only add noise.
 
 ## Roadmap
 - Breathing: validate against the MR60BHA2 radar; a face-anchored chest ROI;
