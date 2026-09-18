@@ -111,6 +111,7 @@ struct TrackerParams {
     float gate_min;       // minimum innovation gate (rate units)
     float r_base, r_scale;  // measurement noise = r_base + r_scale * (1 - quality)^2
     float stab_tol;       // peaks within this distance count as agreeing
+    int lock_run = LOCK_RUN;  // consecutive good windows before a rate is reported
 };
 
 class Tracker {
@@ -130,7 +131,7 @@ public:
     int good_streak() const { return good_; }
     bool tracking() const { return has_ && good_ >= 2; }
     // locked: enough good updates, and not currently in a run of rejected ones
-    bool locked() const { return has_ && good_ >= LOCK_RUN && bad_ <= 3; }
+    bool locked() const { return has_ && good_ >= p_.lock_run && bad_ <= 3; }
 
     // Grow the uncertainty for the time elapsed since the last call.
     void predict(uint32_t now_ms)

@@ -116,7 +116,11 @@ int Buffer::copy(MotionSample *out) const
 // ------------------------------------------------------------------ Estimator
 // process noise 0.25 (/min)^2 per second: breathing changes slowly, and a
 // steadier reading is more useful than a twitchy one
-Estimator::Estimator() : trk_({0.25f, 4.0f, 1.0f, 60.0f, 1.5f})
+// A longer run of good windows than heart rate uses: a room contains plenty of
+// slow periodic motion (fans, curtains, a camera swaying on its cable) that is
+// indistinguishable from breathing in a single window. Measured on an empty
+// room: one false lock in 885 windows at the shorter run.
+Estimator::Estimator() : trk_({0.25f, 4.0f, 1.0f, 60.0f, 1.5f, 6})
 {
     P_ = new float[kChan * NB_EXT_MAX];
     for (int i = 0; i < N; i++) hann_[i] = 0.5f - 0.5f * std::cos(2 * M_PI * i / (N - 1));

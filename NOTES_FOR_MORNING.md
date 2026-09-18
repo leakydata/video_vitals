@@ -111,6 +111,34 @@ That change then exposed a real octave bug, which is fixed (below).
 - Heart rate struggled while you were turned away: no face, so no reading. Expected.
 - Zoom A/B from earlier: breathing locked 56% of windows zoomed against 4% wide.
 
+## The overnight test (you left the chair — thank you)
+
+**Heart rate never reported anything with nobody there.** 885 windows, all `no_signal`.
+That is exactly right and is the result I most wanted.
+
+**Breathing produced one false lock in 885 windows** (~1 per 15 minutes): 14.3 /min,
+with perfect stability and all regions agreeing. Something in your room genuinely
+oscillates at about that rate — a fan, a curtain, the camera swaying on its cable — so
+the quality checks cannot tell it from a person breathing. That single window had
+neighbours just below threshold, so I now require **six consecutive good windows for a
+breathing lock** (heart rate keeps four). Both suites still pass.
+
+I could not verify the fix on the same conditions, because by then **the room had gone
+dark** (brightness 6/255). In darkness the tile tracker flags nearly every window as
+movement — image noise moves the profiles around — so the device reported nothing at
+all for the rest of the night. That is safe behaviour, but it is worth knowing:
+
+- **Without light, there is no measurement.** Not a surprise, but now measured.
+- It strengthens the case for IR: a fixed infrared lamp gives constant, even light with
+  no daylight variation, no screen flicker and no glare. The night case may well measure
+  *better* than your desk does by day.
+- The noise-driven motion flags in the dark are worth revisiting when the IR hardware
+  arrives: if the IR image is dim, the same flagging could mask real breathing. A
+  noise-aware jump threshold (or the fit-residual check Codex suggested) would fix it.
+
+**What would make the empty-room test conclusive:** leave a lamp on with nobody in the
+room. Happy to run that any time.
+
 ## Waiting on you
 
 - **Empty-room test.** Say the word when you're away from the desk and I'll check whether
