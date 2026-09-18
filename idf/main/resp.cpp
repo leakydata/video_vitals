@@ -491,12 +491,39 @@ Result Estimator::update(const MotionSample *s, int n, uint32_t now_ms)
     r.raw = z;
     const int kz = std::clamp(int((z / BR_STEP) - K0 + 0.5f), 0, nb_ - 1);
     r.snr_db = snr_at(fused, nb_ext_, kz);
-    int agree = 0;
-    for (int i = 0; i < sel; i++) agree += std::fabs(bin_br(peak[order[i]]) - z) <= 2.0f;
-    r.agreement = float(agree) / sel;
+    // Agreement is only evidence when it is between *independent* regions. The
+    // two axes of one tile, or a face-anchored box and the tiles it lies over,
+    // watch the same piece of the subject: they will agree with each other
+    // whatever caused the movement, so counting them separately lets a single
+    // artefact pose as a crowd of witnesses. Group the selected channels by the
+    // image area they cover and give each group one vote.
+    uint16_t bt[kBoxes] = {};
+    for (int j = 0; j < n; j++)             // a box drifts over the window: take the union
+        for (int i = 0; i < kBoxes; i++) bt[i] |= s[j].box_tiles[i];
+    uint16_t area[MAX_FUSED];
+    int root[MAX_FUSED];
+    for (int i = 0; i < sel; i++) {
+        const int ch = order[i];
+        area[i] = ch < kBoxChan0 ? uint16_t(1u << (ch / 2)) : bt[(ch - kBoxChan0) / 2];
+        root[i] = i;
+    }
+    auto find = [&](int i) { while (root[i] != i) i = root[i] = root[root[i]]; return i; };
+    for (int i = 0; i < sel; i++)
+        for (int j = i + 1; j < sel; j++)
+            if (area[i] & area[j]) root[find(j)] = find(i);   // overlapping: one region
+    // `order` is sorted by rank, so the first member of a group is its strongest
+    // channel; that one casts the group's vote.
+    int groups = 0, agree = 0;
+    for (int i = 0; i < sel; i++) {
+        if (find(i) != i) continue;
+        groups++;
+        agree += std::fabs(bin_br(peak[order[i]]) - z) <= 2.0f;
+    }
+    r.regions = groups;
+    r.agreement = groups ? float(agree) / groups : 0.0f;
     const float q_snr = 1.0f / (1.0f + std::exp(-(r.snr_db - SNR_MID) / 1.2f));
-    // a lone channel gets no agreement credit
-    const float q_agree = sel >= 2 ? r.agreement : 0.5f;
+    // one region, however many channels it was seen through, is not corroboration
+    const float q_agree = groups >= 2 ? r.agreement : 0.5f;
     r.quality = q_snr * (0.25f + 0.75f * r.stability) * (0.2f + 0.8f * q_agree);
     // An unresolved octave must not be reported confidently: cap the quality
     // below the lock threshold rather than merely halving it.

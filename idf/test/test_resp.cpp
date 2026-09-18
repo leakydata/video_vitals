@@ -239,6 +239,57 @@ static int feed_tests()
     return fails;
 }
 
+// One movement seen through several overlapping regions must not be counted as
+// several independent witnesses. Feed the same oscillation twice: once confined
+// to a single tile and the chest box lying over it (four channels, one physical
+// region), once spread over four separate tiles (four channels, four regions),
+// and check the estimator can tell the difference.
+static int region_tests()
+{
+    auto run_case = [](bool overlapping) {
+        static Buffer buf;
+        static Estimator est;
+        static MotionSample tmp[kCap];
+        buf.clear();
+        est.reset();
+        std::mt19937 rng(7);
+        std::normal_distribution<float> g(0, 0.01f);
+        Result r{};
+        for (float t = 0; t < 80; t += 1 / 20.0f) {
+            MotionSample ms{};
+            ms.t_ms = uint32_t(t * 1000);
+            ms.valid = 0xFFFFFFFFFull;
+            for (int ch = 0; ch < kChan; ch++) ms.d[ch] = g(rng);
+            const float b = 0.5f * std::sin(2 * float(M_PI) * (15.0f / 60) * t);
+            if (overlapping) {
+                ms.box_tiles[0] = 1u << 5;               // the chest box lies over tile 5
+                ms.d[2 * 5] += b;                        // tile 5, both axes
+                ms.d[2 * 5 + 1] += b;
+                ms.d[kBoxChan0] += b;                    // the box itself, both axes
+                ms.d[kBoxChan0 + 1] += b;
+            } else {
+                for (int tile : {5, 6, 9, 10}) ms.d[2 * tile] += b;   // four separate tiles
+            }
+            buf.push(ms);
+            r = est.update(tmp, buf.copy(tmp), ms.t_ms);
+        }
+        return r;
+    };
+    const Result one = run_case(true), many = run_case(false);
+    struct { const char *name; bool ok; } checks[] = {
+        {"one region seen four ways counts as one", one.regions == 1},
+        {"four separate tiles count as several", many.regions >= 3},
+        {"overlapping evidence is not credited as agreement", one.agreement <= many.agreement},
+    };
+    int fails = 0;
+    for (auto &c : checks) {
+        std::printf("  %-52s regions=%d/%d  %s\n", c.name, one.regions, many.regions,
+                    c.ok ? "PASS" : "FAIL");
+        fails += !c.ok;
+    }
+    return fails;
+}
+
 int main(int argc, char **argv)
 {
     auto hr = [](float v) { return [v](float) { return v; }; };
@@ -269,7 +320,7 @@ int main(int argc, char **argv)
             if (std::string(s.name).find(argv[2]) != std::string::npos) f.push_back(s);
         sc = f;
     }
-    int fails = feed_tests(), total = 5;
+    int fails = feed_tests() + region_tests(), total = 8;
     for (auto &s : sc)
         for (int seed = 1; seed <= seeds; seed++) {
             fails += run(s, seed);

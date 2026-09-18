@@ -107,6 +107,7 @@ void TileMotion::process_yuyv(const uint8_t *px, int w, int h, uint32_t t_ms, bo
     out.valid = 0;
     out.jump = 0;
     out.subject = 0;
+    for (uint16_t &bt : out.box_tiles) bt = 0;
     for (float &d : out.d) d = 0;  // invalid channels must still be defined: they are serialised
     out.gross = external_motion;
     if (!have_ref_) {
@@ -159,6 +160,7 @@ void TileMotion::process_yuyv(const uint8_t *px, int w, int h, uint32_t t_ms, bo
                 if (ox > tw / 4 && oy > th / 4) {  // a decent part of the tile is on the subject
                     const int t = ty * GRID_X + tx;
                     out.subject |= (1ull << (2 * t)) | (1ull << (2 * t + 1));
+                    out.box_tiles[i] |= uint16_t(1u << t);
                 }
             }
         out.subject |= (1ull << (kBoxChan0 + 2 * i)) | (1ull << (kBoxChan0 + 2 * i + 1));

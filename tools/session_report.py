@@ -24,6 +24,30 @@ KV = re.compile(rb"(\w+)=([\w.\-]+)")
 STATE = {"no_signal": 0, "acquiring": 1, "locked": 2}
 
 
+def _lines(path, chunk=1 << 20):
+    """Yield newline-terminated chunks of a file without loading it all.
+
+    A telemetry line is short, so anything absurdly long is a JPEG payload that
+    happens to contain no newline: it is truncated rather than buffered, which
+    costs nothing here because such a chunk never holds an HR/RR line.
+    """
+    buf = b""
+    with open(path, "rb") as fh:
+        while True:
+            block = fh.read(chunk)
+            if not block:
+                break
+            buf += block
+            parts = buf.split(b"\n")
+            buf = parts.pop()
+            if len(buf) > 1 << 22:      # no newline in 4 MB: binary, not telemetry
+                buf = buf[-4096:]
+            for part in parts:
+                yield part
+    if buf:
+        yield buf
+
+
 def parse(path):
     hr, rr, pacer = [], [], []
     # annotations live beside the recording: the recording itself is a byte-exact
@@ -34,7 +58,11 @@ def parse(path):
             m = re.match(r"([\d.]+)\s+pacer (on|off) rate=(\d+)", line)
             if m:
                 pacer.append((float(m.group(1)), m.group(2) == "on", float(m.group(3))))
-    for line in open(path, "rb").read().split(b"\n"):
+    # Stream the file rather than reading it whole: a night's recording with
+    # video is hundreds of megabytes, and splitting that in memory needs several
+    # times its size again. Binary JPEG payloads contain stray newlines, so a
+    # "line" here is only a candidate; the HR/RR search below rejects the rest.
+    for line in _lines(path):
         p = max(line.rfind(b"HR "), line.rfind(b"RR "))
         if p < 0:
             continue

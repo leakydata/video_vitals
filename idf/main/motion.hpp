@@ -33,6 +33,11 @@ struct MotionSample {
     uint64_t valid;   // bit per channel: tile has enough texture (34 channels: 64-bit mask)
     uint64_t jump;    // bit per channel: this channel moved too much this frame (local movement)
     uint64_t subject; // bit per channel: this channel covers the subject (0 = unknown, treat all alike)
+    // Which tiles each face-anchored box lies over (bit per tile). A box and
+    // the tiles beneath it watch the same piece of the subject, so they are not
+    // independent evidence; the estimator needs this to say how many genuinely
+    // separate regions agree.
+    uint16_t box_tiles[kBoxes];
     bool gross;       // large movement of the whole scene (not breathing)
 };
 

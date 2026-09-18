@@ -45,9 +45,10 @@ struct Result {
     float snr_db;
     float quality;
     float stability;
-    float agreement;  // fraction of selected channels whose own peak agrees
+    float agreement;  // fraction of independent regions whose own peak agrees
     float motion;     // masked fraction of the window
     int channels;     // channels fused
+    int regions;      // how many of those are genuinely independent (see agreement)
     uint8_t n_nodata, n_still, n_masked, n_weak;  // why the others were dropped
     int best;         // best channel (2*tile + axis), -1 if none
     int8_t sel[8];    // the fused channels themselves (-1 where unused)
