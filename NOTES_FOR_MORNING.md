@@ -188,6 +188,35 @@ empty-room data I have is dark, where the tracker is unreliable for other reason
 needs the lit empty-room recording. I am not loosening a safety threshold on evidence I
 do not have.
 
+## One idea I tried, measured, and threw away
+
+My own note from earlier in this project said *top-down views need an expansion channel,
+not a shift* — and that is exactly the cot geometry. A chest seen from the side rises and
+falls; a chest seen from above **expands**, and its profile barely shifts at all, which a
+shift-only fit cannot see however good the rest of the pipeline is. So I wrote one: a
+Lucas-Kanade fit that solves for a stretch as well as an offset.
+
+It works, and it does not pay for itself:
+
+| clip | shift only | + expansion | + expansion (−6 dB) |
+|---|---|---|---|
+| S01_1 | 65% | **77%** | 71% |
+| S01_2 | 71% | **29%** | 71% |
+| S01_3 | 53% | 53% | 53% |
+| S05_1 | 23% | 26% | 23% |
+
+Left unranked it wins channels it should not: S01_2 is an infant lying on its *side*, where
+breathing is a shift and expansion is a distractor — it outranked the good channel and took
+that clip from 71% to 29%. Penalised so it only wins when clearly better, the damage goes
+away and so does the benefit: 54% against 53%, all of it from one clip.
+
+Against that, measured on the board: **14.80 fps → 13.05 fps**, a 12% frame-rate loss. Not
+a trade worth making for a gain inside the noise of four clips, so it is on the branch
+`experiment/expansion-channel` rather than in main, with the numbers in its commit message.
+
+It deserves another look with footage that is actually overhead and supine — the geometry
+the idea is for, and which only one of these four clips resembles.
+
 ## Two things need you
 
 **1. Codex never ran.** Five attempts, all rejected before it read a line of code:
