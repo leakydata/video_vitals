@@ -102,12 +102,50 @@ What does work, measured with a new test: when the light is adequate, presence a
 0.12 px movement — an infant, or a chest under a blanket. Those numbers are the
 specification for whatever alarm policy you decide on.
 
+**I tried to run the lit empty-room test for you and could not.** I put a white
+full-screen window on the monitors to use them as a lamp; the camera still read
+brightness 3 of 255, because it faces the chair and away from the screens. So that test
+still needs a real lamp and a hand to switch it on.
+
 **This needs daylight data.** Everything I had to calibrate against was recorded in a dim
 room. A recording of you in normal daylight, and one of the empty room with a lamp on,
 would let me set the trust threshold from evidence instead of from the one constant the
 firmware already had.
 
 ---
+
+## It was reporting an infant's wriggling as its breathing rate
+
+There is an annotated infant dataset sitting in `data/air400_infant_breathing` that we had
+never actually evaluated against. I did, and it is the most important thing I found.
+
+**On four real infant clips the device locked in 93 windows, and every single one was
+wrong by more than 5 /min** — typically reporting **8.4 /min against an annotated 19**,
+with quality 0.78, stability 1.00 and every region agreeing. That is the failure mode we
+care about most, on exactly the subject the product is for.
+
+The estimator was not mistaking the rate. I measured the video itself: the strongest
+rhythms in these clips are at **4–8 /min — an infant wriggling — carrying about ten times
+the energy of the breathing at 19 /min.** The device faithfully reported the strongest
+rhythm it could see. What was wrong is that the infant band let it: the band started at
+the *adult's* 6 /min and its filter passed everything above 6 /min, so a wriggle at 8 was
+in band and swamped the breathing above it.
+
+The infant band now starts at 15 /min, in both the peak search and the filter. Fifteen is
+still well below anything clinically slow for an infant, so genuinely slow breathing is
+reported rather than hidden.
+
+**Confidently wrong windows: 93 before, 0 now.**
+
+It does not yet find 19 /min on these clips either — the peak moved 8.4 → 24 and the SNR
+stays negative, so it abstains. Silence is the right answer meanwhile, but finding
+breathing underneath a wriggling infant is the next real problem, and I think it is a
+front-end one: the replay has no face detector, so it is running on the tile grid alone
+with no chest box, which is not how the device works in the room. Trying it with a chest
+box is the first thing to do.
+
+Nothing else regressed: heart rate on UBFC is byte-identical at **1.97 bpm MAE, 94%
+locked**, and the breathing suite passes **79/79** over five seeds.
 
 ## Two things need you
 
