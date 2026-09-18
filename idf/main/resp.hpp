@@ -15,7 +15,10 @@
 
 namespace resp {
 
-constexpr int kCap = 512;
+// The window is 30 s and frames can arrive at 25 fps (the zoomed sensor window
+// reads out faster), so the ring must hold well over 750 samples or the
+// estimator never sees a full window.
+constexpr int kCap = 1024;
 constexpr float FS = 5.0f;
 constexpr float WINDOW_S = 30.0f;
 constexpr int N = 150;  // WINDOW_S * FS
@@ -39,6 +42,7 @@ struct Result {
     float agreement;  // fraction of selected channels whose own peak agrees
     float motion;     // masked fraction of the window
     int channels;     // channels fused
+    uint8_t n_nodata, n_still, n_masked, n_weak;  // why the others were dropped
     int best;         // best channel (2*tile + axis), -1 if none
     int8_t sel[8];    // the fused channels themselves (-1 where unused)
 };
@@ -80,6 +84,7 @@ private:
     rppg::Tracker trk_;
     int prev_best_ = -1;
     int sticky_ = 0;
+    bool still_ = false;   // last resample() bailed because the channel barely moved
 };
 
 } // namespace resp

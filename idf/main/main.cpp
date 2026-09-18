@@ -839,9 +839,10 @@ static void hr_task(void *)
         for (int i = 0, o = 0; i < 8 && rr.sel[i] >= 0 && o < (int)sizeof(sel) - 4; i++)
             o += snprintf(sel + o, sizeof(sel) - o, o ? ",%d" : "%d", rr.sel[i]);
         out_printf("RR br=%.1f raw=%.1f snr=%.1f q=%.2f stab=%.2f agree=%.2f state=%s motion=%.2f ch=%d best=%d "
-                   "sel=%s band=%s est_ms=%.0f\n",
+                   "sel=%s drop=%d/%d/%d/%d band=%s est_ms=%.0f\n",
                    rr.brpm, rr.raw, rr.snr_db, rr.quality, rr.stability, rr.agreement, state_name(rr.state), rr.motion,
-                   rr.channels, rr.best, sel[0] ? sel : "-", cfg.infant ? "infant" : "adult", rms);
+                   rr.channels, rr.best, sel[0] ? sel : "-", rr.n_nodata, rr.n_still, rr.n_masked, rr.n_weak,
+                   cfg.infant ? "infant" : "adult", rms);
     }
 }
 

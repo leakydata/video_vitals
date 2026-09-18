@@ -89,6 +89,19 @@ covered by a regression test (timestamp precision, octave errors, skipped motion
 flags, aliasing, stale buffers, constant-input locks, task synchronisation,
 frame desync, recording annotations, test strictness, host rounding parity).
 
+Sensor-window zoom (`z`), same subject minutes apart:
+
+| | wide | zoomed |
+|---|---|---|
+| breathing locked | 4% of windows | 56% |
+| breathing quality / SNR | 0.18 / +2.7 dB | 0.63 / +6.9 dB |
+| regions fused | 1.0 | 7.3 |
+| heart coherence | 0.06 | 0.28 |
+| frame rate | 14.4 fps | 22.1 fps |
+
+Cropping the sensor to the subject gives both more pixels on skin and a faster
+readout (fewer rows), so it helps twice over.
+
 Camera comparison (same scene, `tools/noise_bench.py`):
 
 | sensor | frame rate | tracker noise | white balance |

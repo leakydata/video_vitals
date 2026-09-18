@@ -15,6 +15,7 @@ constexpr float SNR_MID = 5.0f;    // SNR (dB) at which the SNR quality term is 
 // (fused noise sits at 0-3 dB; real breathing is typically >8 dB)
 constexpr float MOTION_MAX = 0.5f; // max masked fraction for an update
 constexpr int MAX_FUSED = 8;
+constexpr int MIN_FUSED = 3;   // fuse at least this many when available, so agreement means something
 constexpr float SELECT_DB = 6.0f;  // fuse channels within this many dB of the best
 constexpr float STICKY_DB = 3.0f;       // how much better a rival channel must be to take over
 constexpr int STICKY_UPDATES = 3;       // ... and for how many consecutive windows
@@ -254,7 +255,7 @@ bool Estimator::resample(const MotionSample *s, int n, int ch, float *x)
     // those dominate the cost of an update.
     float mn = rv[0], mx = rv[0];
     for (int k = 1; k < m; k++) { mn = std::fmin(mn, rv[k]); mx = std::fmax(mx, rv[k]); }
-    if (mx - mn < 0.02f) return false;
+    if (mx - mn < 0.02f) { still_ = true; return false; }
 
     // A single pole only reaches about -15 dB near the frame rate, so cascade
     // three each way (six poles, zero phase). At 2 Hz this leaves the breathing
@@ -316,9 +317,10 @@ Result Estimator::update(const MotionSample *s, int n, uint32_t now_ms)
     int peak[kChan];
     for (int ch = 0; ch < kChan; ch++) {
         snr[ch] = -99;
-        if (!resample(s, n, ch, x)) continue;
+        still_ = false;
+        if (!resample(s, n, ch, x)) { (still_ ? r.n_still : r.n_nodata)++; continue; }
         float w_[N];
-        if (mask(s, n, ch, w_) > 0.6f) continue;  // this tile was moving most of the time
+        if (mask(s, n, ch, w_) > 0.6f) { r.n_masked++; continue; }  // moving most of the time
         // Weighted linear detrend of each unmasked segment separately: a gross
         // movement usually leaves the subject at a different position, and a
         // level step across the masked span would leak into the low bins.
@@ -347,7 +349,7 @@ Result Estimator::update(const MotionSample *s, int n, uint32_t now_ms)
         for (int i = 0; i < N; i++) { x[i] *= w_[i]; energy += x[i] * x[i]; }
         // Below this the "signal" is numerical residue, not motion: breathing
         // moves a tile by ~0.1 px or more.
-        if (std::sqrt(energy / N) < 0.01f) continue;
+        if (std::sqrt(energy / N) < 0.01f) { r.n_weak++; continue; }
         float *P = P_ + ch * NB_EXT_MAX;
         spectrum(x, P);
         float tot = 0;
@@ -375,8 +377,13 @@ Result Estimator::update(const MotionSample *s, int n, uint32_t now_ms)
     for (int ch = 0; ch < kChan; ch++)
         if (ok[ch]) order[m++] = ch;
     std::sort(order, order + m, [&](int a, int b) { return rank(a) > rank(b); });
+    // Fuse the channels close to the best, but always at least a few when they
+    // exist: agreement between regions is what makes a rate believable, and a
+    // single dominant channel (which is what a good zoom produces) would
+    // otherwise be judged as having no corroboration at all.
     int sel = 0;
     while (sel < m && sel < MAX_FUSED && rank(order[sel]) >= rank(order[0]) - SELECT_DB) sel++;
+    sel = std::min(std::max(sel, MIN_FUSED), m);
     if (!sel) {
         r.state = rppg::NO_SIGNAL;
         trk_.no_signal();
