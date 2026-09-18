@@ -167,6 +167,20 @@ and that is a completely different problem to solve.
 there whenever it has no face (`c` clears it). Pointing the camera at the cot once is what
 a parent would do anyway. Verified working on the board.
 
+**Measured across all four clips.** The evaluator now reports the peak the estimator
+*found* separately from what it was confident enough to state, because on this footage
+that distinction is the whole story. Peak within 2 /min of the annotated rate:
+
+| clip | no region | watch region |
+|---|---|---|
+| S01_1 | 55% | 65% |
+| S01_2 | **0%** | **71%** |
+| S01_3 | 23% | 53% |
+| S05_1 | 6% | 23% |
+
+About a fifth of windows to about a half, just from pointing it at the torso. Regions were
+placed by eye from one frame of each clip.
+
 **What I did not do:** lower the confidence gate so it reports these marginal readings.
 That is the change that would make AIR-400 "work", and it is exactly the change that
 risks bringing back false readings — and I cannot validate it safely, because the only
