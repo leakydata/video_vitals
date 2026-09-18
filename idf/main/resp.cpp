@@ -31,9 +31,12 @@ constexpr float SOS_ADULT[2][6] = {  // 0.10-0.75 Hz (6-45 /min)
     {0.1040783568, 0.2081567135, 0.1040783568, 1.0, -0.8924468669, 0.3769026242},
     {1.0, -2.0, 1.0, 1.0, -1.8306064659, 0.8483158497},
 };
-constexpr float SOS_INFANT[2][6] = {  // 0.10-1.30 Hz (6-78 /min)
-    {0.274726851, 0.5494537021, 0.274726851, 1.0, 0.0102321417, 0.2054888841},
-    {1.0, -2.0, 1.0, 1.0, -1.8234481508, 0.8396135456},
+// The infant band starts where infant breathing starts, not where the adult
+// band does. Real infant video is dominated by slow wriggling, and a passband
+// reaching down to 6 /min lets that through to swamp the breathing above it.
+constexpr float SOS_INFANT[2][6] = {  // 0.25-1.30 Hz (15-78 /min)
+    {0.2229550135, 0.4459100269, 0.2229550135, 1.0, -0.0592905626, 0.2771409409},
+    {1.0, -2.0, 1.0, 1.0, -1.5734190466, 0.6748187325},
 };
 
 void biquads(const float (*sos)[6], float *x, int n)
@@ -142,6 +145,7 @@ void Estimator::set_band(Band b)
     const float max = b == Band::ADULT ? BR_MAX_ADULT : BR_MAX_INFANT;
     nb_ = int(max / BR_STEP) - K0 + 1;
     nb_ext_ = std::min(int(2 * max / BR_STEP) - K0 + 1, NB_EXT_MAX);
+    k0_ = b == Band::ADULT ? 0 : std::max(0, int(BR_MIN_INFANT / BR_STEP) - K0);
     reset();
 }
 
@@ -564,12 +568,13 @@ Result Estimator::update(const MotionSample *s, int n, uint32_t now_ms)
         }
     }
     // stability is judged on the unbiased peak; the tracking prior only picks z
-    const int k_free = argmax(F, nb_);
+    const int k_free = argmax(F + k0_, nb_ - k0_) + k0_;
     r.stability = trk_.stability(bin_br(parabolic(F, k_free, nb_)));
-    const int kb = argmax(Fp, nb_);
+    const int kb = argmax(Fp + k0_, nb_ - k0_) + k0_;
     float z = bin_br(parabolic(Fp, kb, nb_));
     const float br_max = band_ == Band::ADULT ? BR_MAX_ADULT : BR_MAX_INFANT;
-    const rppg::Octave oct = rppg::resolve_octave(wave_, N, FS, z, BR_MIN, br_max, [&](float br) {
+    const float br_min = band_ == Band::ADULT ? BR_MIN : BR_MIN_INFANT;
+    const rppg::Octave oct = rppg::resolve_octave(wave_, N, FS, z, br_min, br_max, [&](float br) {
         const int k = std::clamp(int((br / BR_STEP) - K0 + 0.5f), 0, nb_ext_ - 1);
         return fused[k];
     });

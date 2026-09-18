@@ -27,6 +27,7 @@ def main():
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args()
     all_err = []
+    all_wrong = 0
     for clip in a.clips:
         resp = np.array(h5py.File(clip.replace(".mp4", ".hdf5"))["respiration"])
         fs = len(resp) / 60.0
@@ -53,11 +54,21 @@ def main():
                       f"snr={r['snr']} q={r['q']} stab={r['stab']} agr={r['agree']} st={r['state']} best={r['best']}")
         e = np.abs(errs)
         all_err += list(e)
+        # The number that matters for a monitor is not the average error but how
+        # often it states a rate that is simply wrong: a confident wrong reading
+        # is worse than no reading, because it is the one that gets believed.
+        wrong = int((e > 5).sum())
+        all_wrong += wrong
         print(f"{os.path.basename(clip)}: annotated {len(peaks)} breaths/60 s; windows={n} locked={locked} "
-              f"MAE={e.mean() if len(e) else float('nan'):.2f} /min  within 2/min={100 * (e <= 2).mean() if len(e) else float('nan'):.0f}%")
+              f"MAE={e.mean() if len(e) else float('nan'):.2f} /min  within 2/min={100 * (e <= 2).mean() if len(e) else float('nan'):.0f}%"
+              f"  confidently wrong (>5/min)={wrong}")
     if all_err:
-        print(f"ALL: locked MAE={np.mean(all_err):.2f} /min over {len(all_err)} windows")
+        print(f"ALL: locked MAE={np.mean(all_err):.2f} /min over {len(all_err)} windows; "
+              f"confidently wrong in {all_wrong}")
+    else:
+        print(f"ALL: never locked; confidently wrong in {all_wrong}")
+    return 1 if all_wrong else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

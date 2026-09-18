@@ -28,6 +28,13 @@ constexpr float BR_STEP = 60.0f * FS / NFFT;  // 0.293 breaths/min per bin
 constexpr int K0 = 11;                        // first bin: 6.4 /min
 constexpr float BR_MIN = K0 * BR_STEP;
 constexpr float BR_MAX_ADULT = 45.0f, BR_MAX_INFANT = 78.0f;
+// An infant does not breathe at eight a minute. Real infant video is dominated
+// by slow wriggling -- measured ten times stronger than the breathing itself on
+// the AIR-400 clips -- and a band that starts at the adult's 6 /min lets that
+// wriggle be reported as a breathing rate, confidently. 15 /min is still well
+// below anything clinically slow for an infant, so a genuinely slow rate is
+// still reported rather than hidden.
+constexpr float BR_MIN_INFANT = 15.0f;
 constexpr int NB_EXT_MAX = NFFT / 2 - K0;     // up to Nyquist (150 /min)
 
 enum class Band : uint8_t { ADULT, INFANT };
@@ -84,6 +91,7 @@ private:
     void check_presence(const MotionSample *s, int n, Result &r);
 
     Band band_ = Band::ADULT;
+    int k0_ = 0;   // first bin the band allows (see BR_MIN_INFANT)
     int nb_ = 0, nb_ext_ = 0;
     float hann_[N];
     float *P_ = nullptr;  // kChan * NB_EXT_MAX
