@@ -37,6 +37,7 @@
 #include "esp_camera.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -54,6 +55,7 @@
 static const char *TAG = "heart_cam";
 
 [[noreturn]] static void fatal(const char *why);   // blink fast and say why, rather than run on
+static void set_geometry(int pid);                 // sensor array size, read at start-up
 
 // ---------------------------------------------------------------- pins
 static constexpr int CAM_XCLK = 10, CAM_SIOD = 40, CAM_SIOC = 39;
@@ -221,7 +223,10 @@ static bool camera_init()
         return false;
     }
     sensor_t *s = esp_camera_sensor_get();
-    ESP_LOGI(TAG, "sensor PID=0x%04x", s->id.PID);
+    ESP_LOGI(TAG, "sensor PID=0x%04x (%s)", s->id.PID,
+             s->id.PID == OV5640_PID ? "OV5640" : s->id.PID == OV3660_PID ? "OV3660"
+             : s->id.PID == OV2640_PID ? "OV2640" : "unknown");
+    set_geometry(s->id.PID);
     apply_flip();
     s->set_lenc(s, 1);
     s->set_bpc(s, 1);
@@ -273,10 +278,28 @@ static void auto_then_lock(int ms)
 // The sensor can read out a window of its array instead of the whole thing.
 // Cropping to the subject puts far more sensor pixels on the skin at the same
 // output size and frame rate — an electronic telephoto — which is what the
-// heart-rate signal is short of. Geometry from the driver's 4:3 table:
-// array 2048x1536, end margins +32/+12, offset 16,6, line length 2300.
-static constexpr int ARR_W = 2048, ARR_H = 1536, TOTAL_X = 2300;
-static struct { int x = 0, y = 0, w = ARR_W, h = ARR_H; } win;  // current sensor window
+// heart-rate signal is short of. The geometry is the sensor's own, so it is
+// read from the sensor at start-up rather than compiled in: the OV3660 has a
+// 2048x1536 array and a 2300-pixel line, the OV5640 a 2592x1944 array and a
+// 2844-pixel one, and windowing one with the other's numbers programs registers
+// that do not describe the part.
+static struct SensorGeom {
+    int arr_w = 2048, arr_h = 1536, total_x = 2300;   // OV3660 until told otherwise
+    int end_x = 32, end_y = 12, off_x = 16, off_y = 6;
+    int blank_y = 28;
+} geom;
+static int ARR_W = geom.arr_w, ARR_H = geom.arr_h;   // shorthand used all over
+static struct { int x = 0, y = 0, w = 2048, h = 1536; } win;  // current sensor window
+
+// Called once the sensor has been identified.
+static void set_geometry(int pid)
+{
+    if (pid == OV5640_PID) geom = {2592, 1944, 2844, 32, 12, 16, 6, 28};
+    else                   geom = {2048, 1536, 2300, 32, 12, 16, 6, 28};
+    ARR_W = geom.arr_w;
+    ARR_H = geom.arr_h;
+    win = {0, 0, ARR_W, ARR_H};
+}
 
 static void apply_window(int cx, int cy, int cw)
 {
@@ -288,9 +311,9 @@ static void apply_window(int cx, int cy, int cw)
     cx = std::clamp(cx - cw / 2, 0, ARR_W - cw);
     cy = std::clamp(cy - ch / 2, 0, ARR_H - ch);
     const bool binning = cw >= 2 * W && ch >= 2 * H;
-    const int total_y = binning ? (ch + 28) / 2 + 1 : ch + 28;
-    if (s->set_res_raw(s, cx, cy, cx + cw - 1 + 32, cy + ch - 1 + 12, 16, 6, TOTAL_X, total_y, W, H, true,
-                       binning) != 0) {
+    const int total_y = binning ? (ch + geom.blank_y) / 2 + 1 : ch + geom.blank_y;
+    if (s->set_res_raw(s, cx, cy, cx + cw - 1 + geom.end_x, cy + ch - 1 + geom.end_y, geom.off_x, geom.off_y,
+                       geom.total_x, total_y, W, H, true, binning) != 0) {
         ESP_LOGW(TAG, "window %dx%d at %d,%d rejected", cw, ch, cx, cy);
         return;
     }
@@ -301,7 +324,8 @@ static void apply_window(int cx, int cy, int cw)
 static void apply_flip()
 {
     sensor_t *s = esp_camera_sensor_get();
-    const bool base_vflip = s->id.PID == OV3660_PID;
+    // both of these read out flipped on the XIAO's mounting
+    const bool base_vflip = s->id.PID == OV3660_PID || s->id.PID == OV5640_PID;
     s->set_vflip(s, base_vflip ^ cfg.flipped);
     s->set_hmirror(s, cfg.flipped);
 }
@@ -1166,6 +1190,11 @@ static void cmd_task(void *)
 
 extern "C" void app_main(void)
 {
+    // Why we are here. Worth a line at every boot: a board that resets in a loop
+    // says nothing useful unless the reason survives the reset.
+    ESP_LOGI(TAG, "boot: reset reason %d (1=power, 4=panic, 6=task wdt, 9=brownout)",
+             (int)esp_reset_reason());
+
     out_mtx = xSemaphoreCreateMutex();
     stats.mtx = xSemaphoreCreateMutex();
     face_mtx = xSemaphoreCreateMutex();
