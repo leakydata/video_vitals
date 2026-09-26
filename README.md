@@ -4,14 +4,32 @@ Contactless heart rate (rPPG) and breathing rate on a XIAO ESP32-S3 Sense
 (OV3660). Both are computed **on the ESP32** — no PC, phone or cloud — and the
 PC viewer is optional.
 
-> **This repository is private on purpose.** A prior-art search (2026-09-17)
-> found no published or shipped system computing rPPG *or* camera-based
-> respiration on a microcontroller: existing ESP32 projects stream frames to a
-> PC, and commercial camera-vitals products are phone-, cloud- or server-class.
-> Publishing destroys patent novelty immediately outside the US (the US allows a
-> 12-month grace period), so the repo stays private until that decision is made.
-> The algorithms themselves (POS, Lucas-Kanade, ESP-DL detection) are published
-> work; what appears unclaimed is the integration and the compute envelope.
+> **Published as prior art, under Apache 2.0 — build on it, sell it, no
+> permission needed.** A prior-art search (17 September 2026) found no published
+> or shipped system computing rPPG *or* camera-based respiration on a
+> microcontroller: existing ESP32 projects stream frames to a PC, and commercial
+> camera-vitals products are phone-, cloud- or server-class. The algorithms
+> themselves (POS, Lucas-Kanade, ESP-DL detection) are published work; what
+> appeared unclaimed was the integration and the compute envelope.
+>
+> Rather than pursue that, it is released here. Two reasons: the surrounding
+> patent landscape makes it a poor thing for one person to commercialise, and
+> publication puts it beyond anyone else's reach too — this repository, and its
+> dated history, are prior art against later claims over the same ground. The
+> Apache licence carries an express patent grant, so anyone building a product
+> on this code is safe from patent claims by its author.
+
+## Licence
+Apache License 2.0 — see [LICENSE](LICENSE). Commercial use is expressly
+permitted and no attribution beyond the licence terms is required.
+
+**A caution if you build something clinical.** None of this is a medical device,
+has been through any regulatory process, or has been validated against a
+clinical reference on more than one adult. The measured accuracy on public
+datasets is in `NOTES_FOR_MORNING.md` and the tools that produced it are in
+`tools/`; the honest summary is that heart rate is good in decent light on a
+still adult, and breathing on a sleeping infant is *not yet* reliable enough to
+depend on. Read those numbers before trusting it with anyone's safety.
 
 ## Layout
 - `idf/` — ESP-IDF firmware (current)

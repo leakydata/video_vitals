@@ -1,0 +1,8 @@
+video_vitals
+Copyright 2026 leakydata (https://github.com/leakydata)
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+Contactless heart rate (rPPG) and breathing rate computed on an ESP32-S3
+microcontroller. Published as prior art: free for anyone to use, and evidence
+against later claims of novelty over the same ground.
